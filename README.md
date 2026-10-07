@@ -32,7 +32,10 @@ js/
 icons/             app icons (SVG + PNG)
 supabase/schema.sql
 tools/coach-proxy.mjs   tiny CORS proxy for the OpenClaw gateway (runs on your Mac)
+tools/coach-local.mjs   recommended private bridge: separate token + Telegram delivery (Node 22+)
+docs/coach-bridge.md    private bridge setup and operating notes
 tests/unit.test.mjs     parser/stats/SSE unit tests (node --test)
+tests/coach-local.test.mjs  bridge auth, routing, streaming and delivery retry tests
 tests/e2e.py            headless Chromium end-to-end test (Playwright)
 ```
 
@@ -94,6 +97,13 @@ How sync behaves:
 
 ## 4. OpenClaw coach
 
+**Recommended for an existing Telegram workout thread:** follow
+[the private coach bridge setup](docs/coach-bridge.md). It keeps your full OpenClaw
+credential on the Mac, uses a separate Pulse token, and explicitly posts saved-workout
+takeaways to Telegram. Continuing a Telegram session over the HTTP API does **not**
+automatically deliver its answer to Telegram. The passthrough setup below remains
+available for compatibility but has neither that token separation nor mirroring.
+
 Pulse calls your OpenClaw Gateway's OpenAI-compatible endpoint (docs: <https://docs.openclaw.ai/gateway/openai-http-api>):
 
 ```
@@ -120,7 +130,8 @@ It's off by default. Add this to `~/.openclaw/openclaw.json`:
 }
 ```
 
-Or run `openclaw config set gateway.http.endpoints.chatCompletions.enabled true`, then restart the gateway.
+Or run `openclaw config set gateway.http.endpoints.chatCompletions.enabled true`.
+Follow the CLI's reload guidance; current versions can apply it without restarting.
 
 **Token:** the gateway uses `gateway.auth.mode = "token"` by default. Show the current token with `openclaw gateway auth-token --show` (treat the output as a password), or set one yourself with `gateway.auth.token` or the `OPENCLAW_GATEWAY_TOKEN` environment variable. If no token is configured, the gateway generates a runtime-only one at startup, so set a fixed one. Paste it into **Settings → Coach → Gateway token**. It's stored only in that browser's localStorage.
 
@@ -203,7 +214,7 @@ What happens when you save a workout (Save notes or Skip):
 ## 6. Tests
 
 ```bash
-node --test tests/unit.test.mjs                          # 0x2A37 parser, notes parser, stats, SSE, coach log + proxy
+node --test tests/*.test.mjs                             # Node 22+: parsers, stats, SSE, coach log, proxy + bridge
 pip install playwright && python -m playwright install chromium
 python3 -m http.server 8765 &                            # from this folder
 python3 tests/e2e.py                                     # CHROMIUM=/path/to/chromium to use a system browser

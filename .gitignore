@@ -1,3 +1,9 @@
 tests/screenshots/
 node_modules/
 .DS_Store
+.env
+.env.*
+!.env.example
+LOCAL-INTEGRATION.md
+proxy-token
+deliveries/
