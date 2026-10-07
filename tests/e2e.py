@@ -65,12 +65,32 @@ async def no_overflow(page, name):
     ov = await page.evaluate('document.documentElement.scrollWidth - window.innerWidth')
     check(f'{name}: no horizontal overflow', ov <= 1, f'overflow {ov}px')
 
-async def seed_settings(page, session_key=''):
+async def seed_settings(page, session_key='', demo=True):
+    # demo=False: a scripted fake Polar strap (FAKE_BT) records a "real" workout
+    if not demo:
+        await page.add_init_script(FAKE_BT)
     await page.add_init_script(f"""
       if (!localStorage.getItem('pulse.settings')) localStorage.setItem('pulse.settings', JSON.stringify({{
-        demo: true, gatewayUrl: '{COACH}', gatewayToken: 'test-token', coachModel: 'openclaw/default', coachSessionKey: '{session_key}'
+        demo: {'true' if demo else 'false'}, gatewayUrl: '{COACH}', gatewayToken: 'test-token', coachModel: 'openclaw/default', coachSessionKey: '{session_key}'
       }}));
     """)
+
+COACH_FIELDS = ['log_id', 'revision', 'date', 'kind', 'status', 'source', 'started_at', 'ended_at', 'duration_s',
+                'avg_hr', 'max_hr', 'min_hr', 'calories_kcal', 'zones', 'hrv', 'hr_trace', 'notes_raw', 'summary']
+
+async def kind_selected(page):
+    return await page.evaluate("document.querySelector('#kind-chips .on')?.dataset.kind || null")
+
+async def wait_js(page, expr, timeout=8000):
+    """Poll a (possibly Promise-returning) expression until truthy. page.wait_for_function
+    treats a returned Promise object as truthy, so IndexedDB checks need this."""
+    deadline = time.time() + timeout / 1000
+    while True:
+        if await page.evaluate(expr):
+            return True
+        if time.time() > deadline:
+            raise TimeoutError(f'wait_js timed out: {expr[:100]}')
+        await page.wait_for_timeout(100)
 
 def log_requests(coach_requests):
     return [r for r in coach_requests if r['body'].get('stream') is False]
@@ -157,6 +177,20 @@ async def phone_flow(browser, errors):
     chips = await page.inner_text('#parsed-chips')
     for want in ['Type: Strength', 'Focus: Upper body', 'Bench press 4×8 @155 lb', 'Pull-ups 3×10', 'Effort 7/10', 'Sleep ~6 h', 'Shoulder tightness']:
         check(f'notes chip: {want}', want in chips)
+    check('kind: picker shows 5 kinds', await page.locator('#kind-chips [data-kind]').count() == 5)
+    check('kind: upper-body notes without A/B -> Other preselected', await kind_selected(page) == 'other', str(await kind_selected(page)))
+    await page.fill('#notes-text', 'Easy zone 2 run on the treadmill')
+    await page.wait_for_timeout(400)
+    check('kind: guess follows notes (zone 2 run -> Cardio)', await kind_selected(page) == 'cardio', str(await kind_selected(page)))
+    await page.fill('#notes-text', 'Upper A. Bench 4 sets of 8 at 155')
+    await page.wait_for_timeout(400)
+    check('kind: "Upper A" in notes -> Upper A', await kind_selected(page) == 'upper-a', str(await kind_selected(page)))
+    await page.fill('#notes-text', NOTES)
+    await page.wait_for_timeout(400)
+    await page.click('#kind-chips [data-kind="upper-a"]')
+    await page.fill('#notes-text', NOTES + ' ')
+    await page.wait_for_timeout(400)
+    check('kind: manual pick sticks while notes change', await kind_selected(page) == 'upper-a')
     await page.screenshot(path=str(OUT / 'phone-4-notes.png'))
     await no_overflow(page, 'phone notes')
     await page.click('#save-notes')
@@ -180,40 +214,46 @@ async def phone_flow(browser, errors):
     async with page.expect_download() as dl:
         await page.click('#dl-json')
     j = json.loads(pathlib.Path(await (await dl.value).path()).read_text())
-    check('JSON export has session/notes/samples', j['format'] == 'pulse-session' and j['notes']['text'] == NOTES and len(j['samples']) >= 8)
+    check('JSON export has session/notes/samples', j['format'] == 'pulse-session' and j['notes']['text'].strip() == NOTES and len(j['samples']) >= 8)
+    check('session: kind saved + shown in kind select', j['session'].get('kind') == 'upper-a' and await page.input_value('#session-kind') == 'upper-a')
     check('session has a recorded gap', len(j['session']['gaps']) >= 1, json.dumps(j['session']['gaps']))
-    # Auto-send: the workout log goes into the coach session right after saving
+    # Demo strap: never auto-sent, even with a session key; a manual send is marked demo
     banner = await page.inner_text('#screen-session .banner')
-    check('auto-send: banner reports the coach send (no manual button)', ('Sending it to your coach' in banner or 'Your coach has it' in banner) and await page.locator('#send-coach').count() == 0, banner)
+    check('demo: banner says not sent automatically + manual button', 'Demo workout' in banner and await page.locator('#send-coach').count() == 1, banner)
+    await page.wait_for_timeout(1000)
+    check('demo: nothing auto-posted to the coach', not log_requests(coach_requests) and await chip_status(page) == 'none', str(len(log_requests(coach_requests))))
+    await page.click('#send-coach')
     await page.wait_for_function("document.querySelector('#coach-log-status .coach-chip')?.dataset.status === 'sent'", timeout=8000)
-    check('auto-send: status chip shows sent', (await page.inner_text('#coach-log-status')).startswith('Sent to coach'))
-    await page.wait_for_function("document.querySelector('#saved-coach-note')?.textContent === 'Your coach has it.'", timeout=3000)
-    check('auto-send: banner updates once the coach has it', True)
+    check('demo manual send: status chip shows sent', (await page.inner_text('#coach-log-status')).startswith('Sent to coach'))
     logs = log_requests(coach_requests)
-    check('auto-send: exactly one non-streaming log request', len(logs) == 1, f'{len(logs)} log requests')
+    check('demo manual send: exactly one non-streaming log request', len(logs) == 1, f'{len(logs)} log requests')
     lr = logs[0] if logs else {'headers': {}, 'body': {}}
-    check('auto-send: x-openclaw-session-key header sent', lr['headers'].get('x-openclaw-session-key') == SESSION_KEY, lr['headers'].get('x-openclaw-session-key'))
-    check('auto-send: bearer token + model', lr['headers'].get('authorization') == 'Bearer test-token' and lr['body'].get('model') == 'openclaw/default')
+    check('log: x-openclaw-session-key header sent', lr['headers'].get('x-openclaw-session-key') == SESSION_KEY, lr['headers'].get('x-openclaw-session-key'))
+    check('log: bearer token + model', lr['headers'].get('authorization') == 'Bearer test-token' and lr['body'].get('model') == 'openclaw/default')
     msgs = lr['body'].get('messages') or [{}]
     text = msgs[0].get('content', '')
     check('log: one user message with PULSE WORKOUT LOG v1 header', len(msgs) == 1 and msgs[0].get('role') == 'user' and text.startswith('PULSE WORKOUT LOG v1\nlog_id: '), text[:60])
-    check('log: asks coach to save to workspace + 2-3 sentence takeaway', 'save this workout to your workspace training log' in text and '2–3 sentence takeaway' in text)
-    check('log: human summary lines', all(k in text for k in ['- When: ', '- Duration: ', '- Heart rate: avg ', '- Time in zones: ', '- Calories: ~', 'Bench press 4×8 @155 lb', 'effort 7/10', '- Notes (raw): "Upper body day.']))
+    check('demo log: instruction says CONNECTION TEST, do not insert', 'DEMO / CONNECTION TEST' in text and 'Do NOT insert it into health.sqlite3' in text and 'fitness/' not in text)
+    check('log: human summary lines', all(k in text for k in ['- When: ', '- Kind: Upper A', '- Duration: ', '- Heart rate: avg ', '- Time in zones: ', '- Calories: ~', 'Bench press 4×8 @155 lb', 'effort 7/10', '- Notes (raw): "Upper body day.']))
     data = parse_log(text) or {}
     tr = data.get('hr_trace', {})
     check('log JSON: format/version/log_id', data.get('format') == 'pulse-workout-log' and data.get('version') == 1 and data.get('log_id') == j['session']['id'])
+    check('log JSON: coach workouts fields at top level, no number', all(k in data for k in COACH_FIELDS) and 'number' not in data, ','.join(k for k in COACH_FIELDS if k not in data))
+    check('log JSON: demo source, kind, done, local date', data.get('source') == 'demo' and data.get('kind') == 'upper-a' and data.get('status') == 'done'
+          and data.get('date') == data.get('started_at', '')[:10] and data.get('session', {}).get('source') == 'demo', json.dumps({k: data.get(k) for k in ['source', 'kind', 'status', 'date']}))
     check('log JSON: 5-second HR trace', tr.get('interval_s') == 5 and len(tr.get('points', [])) >= 2 and all(p[0] % 5 == 0 for p in tr['points']), json.dumps(tr)[:120])
-    check('log JSON: zones + notes fields', len(data.get('zones', {}).get('zones', [])) == 5 and data.get('notes', {}).get('fields', {}).get('effort') == 7 and data['notes']['text'] == NOTES)
+    check('log JSON: zones + notes fields', len(data.get('zones', {}).get('zones', [])) == 5 and data.get('notes', {}).get('fields', {}).get('effort') == 7 and data['notes']['text'] == NOTES and data.get('notes_raw') == NOTES)
     check('log JSON: no raw RR intervals', '"rr_ms"' not in text)
-    await page.wait_for_selector('#coach-takeaway:not([hidden])', timeout=3000)
-    check('session: coach takeaway card shows the reply', 'Solid upper-body session' in await page.inner_text('#coach-takeaway'))
-    # Coach panel shows the log + reply, then a streamed follow-up in the same session
-    await page.click('#open-coach')
-    await page.wait_for_selector('#coach:not([hidden]) .msg.log')
+    await page.wait_for_selector('#coach:not([hidden]) .msg.log', timeout=5000)
     panel = await page.inner_text('#coach-messages')
     check('coach panel: log bubble + coach reply', 'Workout log sent to coach' in panel and 'Solid upper-body session' in panel, panel[:120])
     await page.wait_for_timeout(300)
     await page.screenshot(path=str(OUT / 'phone-7-coach.png'))
+    await page.click('#coach-close')
+    await page.wait_for_selector('#coach-takeaway:not([hidden])', timeout=3000)
+    check('session: coach takeaway card shows the reply', 'Solid upper-body session' in await page.inner_text('#coach-takeaway'))
+    await page.click('#open-coach')
+    await page.wait_for_selector('#coach:not([hidden]) .msg.log')
     await page.fill('#coach-input', 'What should I do tomorrow?')
     await page.press('#coach-input', 'Enter')
     await page.wait_for_function("document.querySelectorAll('#coach .msg.assistant:not(.streaming)').length >= 2", timeout=8000)
@@ -317,7 +357,8 @@ async def desk_flow(browser, errors):
     await page.wait_for_selector('#coach:not([hidden]) .msg.log', timeout=5000)
     logs = log_requests(desk_requests)
     check('desk: manual "Send to coach" posts the log without a session header',
-          len(logs) == 1 and 'x-openclaw-session-key' not in logs[0]['headers'] and logs[0]['body']['messages'][0]['content'].startswith('PULSE WORKOUT LOG v1'))
+          len(logs) == 1 and 'x-openclaw-session-key' not in logs[0]['headers'] and logs[0]['body']['messages'][0]['content'].startswith('PULSE WORKOUT LOG v1')
+          and (parse_log(logs[0]['body']['messages'][0]['content']) or {}).get('source') == 'demo')
     await page.click('#coach-close')
     await page.wait_for_timeout(300)
     await page.screenshot(path=str(OUT / 'desk-5-session.png'), full_page=True)
@@ -417,6 +458,7 @@ async def fake_ble_flow(browser, errors):
     samples = await page.evaluate(f"window.__pulse.db.getSamples('{sid}')")
     check('BLE: samples stored with RR intervals', len(samples) >= 3 and all(len(x['rr_ms']) == 1 for x in samples), f'{len(samples)} samples')
     await page.click('#skip-notes')
+    await page.wait_for_selector('#screen-session:not([hidden]) h1', timeout=5000)
     await page.goto(BASE + '#/')
     await page.wait_for_selector('#start-btn')
     strap_chip = await page.inner_text('#strap-chip')
@@ -436,7 +478,7 @@ async def coach_retry_flow(browser, errors):
     reqs = []
     mode = {'fail': True}
     await attach(page, 'retry', errors, reqs, mode)
-    await seed_settings(page, SESSION_KEY)
+    await seed_settings(page, SESSION_KEY, demo=False)
     sid = await record_workout(page, seconds=3000)
     await page.wait_for_function("document.querySelector('#coach-log-status .coach-chip')?.dataset.status === 'failed'", timeout=8000)
     chip = await page.inner_text('#coach-log-status')
@@ -446,29 +488,48 @@ async def coach_retry_flow(browser, errors):
     sess = await page.evaluate(f"window.__pulse.db.get('sessions', '{sid}')")
     notes = await page.evaluate(f"window.__pulse.db.get('notes', '{sid}')")
     samples = await page.evaluate(f"window.__pulse.db.getSamples('{sid}').then(x => x.length)")
-    check('retry: workout, notes and samples saved despite coach failure', sess and sess['status'] == 'complete' and notes and notes['text'] == NOTES and samples >= 2, f'{samples} samples')
+    check('retry: workout, notes and samples saved despite coach failure', sess and sess['status'] == 'complete' and sess['source'] == 'ble' and notes and notes['text'] == NOTES and samples >= 2, f'{samples} samples')
     await page.screenshot(path=str(OUT / 'phone-10-coach-failed.png'))
     # network failure on manual retry (coach offline)
     mode['fail'] = 'abort'
     await page.click('#coach-send-log')
-    await page.wait_for_function(f"window.__pulse.db.get('coachlog', '{sid}').then(r => r && r.status === 'failed' && r.attempts === 2)", timeout=8000)
+    await wait_js(page, f"window.__pulse.db.get('coachlog', '{sid}').then(r => r && r.status === 'failed' && r.attempts === 2)", timeout=8000)
     check('retry: manual retry while offline stays failed (attempts 2)', True)
     # coach comes back: reopening the app retries pending/failed logs
     mode['fail'] = False
     n_before = len(log_requests(reqs))
     await page.reload()
-    await page.wait_for_function(f"window.__pulse.db.get('coachlog', '{sid}').then(r => r && r.status === 'sent')", timeout=10000)
+    await wait_js(page, f"window.__pulse.db.get('coachlog', '{sid}').then(r => r && r.status === 'sent')", timeout=10000)
     check('retry: next app open re-sends and marks it sent', len(log_requests(reqs)) == n_before + 1)
     last = log_requests(reqs)[-1]
     check('retry: re-send carries the session key and same log_id', last['headers'].get('x-openclaw-session-key') == SESSION_KEY and (parse_log(last['body']['messages'][0]['content']) or {}).get('log_id') == sid)
+    ltext = last['body']['messages'][0]['content']
+    ld = parse_log(ltext) or {}
+    check('real log: health.sqlite3 instruction (upsert days, workouts by log_id, polar_json, workout-log.md)',
+          all(k in ltext for k in ['map this into health.sqlite3 per its existing write rules', 'upsert days for', 'upsert workouts by log_id', 'polar_json', 'do not insert demo', 'workout-log.md', '2–3 sentence takeaway']) and 'fitness/' not in ltext)
+    check('real log: source pulse, status done, kind other (no A/B in notes), no number',
+          ld.get('source') == 'pulse' and ld.get('status') == 'done' and ld.get('kind') == 'other' and 'number' not in ld and all(k in ld for k in COACH_FIELDS),
+          json.dumps({k: ld.get(k) for k in ['source', 'status', 'kind', 'revision']}))
     await page.wait_for_function("document.querySelector('#coach-log-status .coach-chip')?.dataset.status === 'sent'", timeout=5000)
     check('retry: chip updates to sent with "Send again"', await page.locator('#coach-send-log').inner_text() == 'Send again')
     await page.screenshot(path=str(OUT / 'phone-11-coach-sent.png'), full_page=True)
+    # kind edit on the session page -> revision bump + re-send (same log_id)
+    n_before = len(log_requests(reqs))
+    rev_before = ld.get('revision') or 1
+    sent_before = (await page.evaluate(f"window.__pulse.db.get('coachlog', '{sid}')"))['sentCount']
+    await page.select_option('#session-kind', 'upper-b')
+    await wait_js(page, f"window.__pulse.db.get('coachlog', '{sid}').then(r => r && r.status === 'sent' && r.sentCount > {sent_before})", timeout=8000)
+    kd = parse_log(log_requests(reqs)[-1]['body']['messages'][0]['content']) or {}
+    await page.wait_for_timeout(2000)
+    sess = await page.evaluate(f"window.__pulse.db.get('sessions', '{sid}')")
+    check('kind edit: re-sent with kind upper-b, higher revision, same log_id',
+          len(log_requests(reqs)) == n_before + 1 and kd.get('kind') == 'upper-b' and kd.get('revision', 0) > rev_before and kd.get('log_id') == sid
+          and sess.get('kind') == 'upper-b' and sess.get('revision') == 2, json.dumps({k: kd.get(k) for k in ['kind', 'revision']}))
     # skip-notes still sends (no notes in payload)
     sid2 = await record_workout(page, seconds=2500, notes=None)
     await page.wait_for_function("document.querySelector('#coach-log-status .coach-chip')?.dataset.status === 'sent'", timeout=8000)
     d2 = parse_log(log_requests(reqs)[-1]['body']['messages'][0]['content']) or {}
-    check('retry: skipped notes -> log still sent with notes null', d2.get('log_id') == sid2 and d2.get('notes') is None)
+    check('retry: skipped notes -> log still sent with notes null', d2.get('log_id') == sid2 and d2.get('notes') is None and d2.get('notes_raw') is None and d2.get('source') == 'pulse')
     # settings: session key + toggle
     await page.goto(BASE + '#/settings')
     await page.wait_for_selector('#coach-autosend')
@@ -526,8 +587,9 @@ async def sync_flow(browser, errors):
             return await route.fulfill(status=201, headers=cors, content_type='application/json', body='[]')
         await route.fulfill(status=404, headers=cors, body='')
     await page.route(f'{SB}/**', sb)
+    await page.add_init_script(FAKE_BT)
     await page.add_init_script(f"""if (!localStorage.getItem('pulse.settings')) localStorage.setItem('pulse.settings', JSON.stringify({{
-        demo: true, supabaseUrl: '{SB}', supabaseAnonKey: 'anon-test-key' }}));""")
+        demo: false, supabaseUrl: '{SB}', supabaseAnonKey: 'anon-test-key' }}));""")
     await page.goto(BASE + '#/settings')
     await page.wait_for_selector('#auth-email', timeout=15000)
     await page.fill('#auth-email', 'me@example.com')
@@ -539,36 +601,55 @@ async def sync_flow(browser, errors):
     await page.click('#verify-code')
     await page.wait_for_selector('#sync-now', timeout=8000)
     check('sync: 6-digit code sign-in (verifyOtp)', True)
-    # record a short workout, save it, and watch the upserts
-    await page.goto(BASE + '#/')
-    await page.wait_for_selector('#start-btn')
-    await page.click('#start-btn')
-    await page.wait_for_selector('#screen-live:not([hidden])', timeout=8000)
-    await page.wait_for_timeout(3500)
-    await page.click('#end-btn'); await page.click('#end-btn')
-    await page.wait_for_selector('#screen-notes:not([hidden])')
-    await page.fill('#notes-text', NOTES)
-    await page.click('#save-notes')
+    # record a short (fake-strap, i.e. real) workout, save it, and watch the upserts
+    async def record(notes):
+        await page.goto(BASE + '#/')
+        await page.wait_for_selector('#start-btn')
+        await page.click('#start-btn')
+        await page.wait_for_selector('#screen-live:not([hidden])', timeout=8000)
+        await page.wait_for_timeout(3500)
+        await page.click('#end-btn'); await page.click('#end-btn')
+        await page.wait_for_selector('#screen-notes:not([hidden])')
+        await page.fill('#notes-text', notes)
+        await page.click('#save-notes')
+        await page.wait_for_selector('#screen-session:not([hidden]) h1', timeout=5000)
+    await record('Leg day. Squats 5 sets of 5 at 225. Effort 8 out of 10.')
     for _ in range(50):
-        if any(r[0] == 'POST' and '/rest/v1/notes' in r[1] for r in rest): break
+        if any(r[0] == 'POST' and '/rest/v1/workouts' in r[1] for r in rest): break
         await page.wait_for_timeout(200)
     await page.wait_for_timeout(300)
     posts = [r for r in rest if r[0] == 'POST']
-    print('   sync requests:', [(r[0], r[1].split('/v1/')[1][:50]) for r in rest])
+    print('   sync requests:', [(r[0], r[1].split('/v1/')[1][:60]) for r in rest])
     tables = [re.search(r'/rest/v1/(\w+)', r[1]).group(1) for r in posts]
-    check('sync: upserts sessions, samples, notes', all(t in tables for t in ['sessions', 'samples', 'notes']), ','.join(tables))
-    srow = json.loads([r for r in posts if '/sessions' in r[1]][0][2])
-    srow = srow[0] if isinstance(srow, list) else srow
-    check('sync: session row shape', all(k in srow for k in ['id', 'started_at', 'avg_hr', 'zone_seconds', 'laps']) and 'user_id' not in srow)
-    smp = json.loads([r for r in posts if '/samples' in r[1]][0][2])
-    check('sync: sample rows shape', isinstance(smp, list) and {'session_id', 'seq', 't', 'hr', 'rr_ms'} <= set(smp[0].keys()))
-    check('sync: upsert uses on_conflict', any('on_conflict=session_id%2Cseq' in r[1] or 'on_conflict=session_id,seq' in r[1] for r in posts))
-    # delete propagates through outbox
-    sid = srow['id']
+    check('sync: upserts days then workouts (no sessions/samples/notes tables)', 'days' in tables and 'workouts' in tables and tables.index('days') < tables.index('workouts')
+          and not any(t in tables for t in ['sessions', 'samples', 'notes']), ','.join(tables))
+    dpost = [r for r in posts if '/rest/v1/days' in r[1]][0]
+    drow = json.loads(dpost[2]); drow = drow[0] if isinstance(drow, list) else drow
+    check('sync: days row = user_id + date only, on_conflict user_id,date', set(drow) == {'user_id', 'date'} and re.match(r'\d{4}-\d\d-\d\d$', drow['date'])
+          and ('on_conflict=user_id%2Cdate' in dpost[1] or 'on_conflict=user_id,date' in dpost[1]), json.dumps(drow) + ' ' + dpost[1])
+    wpost = [r for r in posts if '/rest/v1/workouts' in r[1]][0]
+    wrow = json.loads(wpost[2]); wrow = wrow[0] if isinstance(wrow, list) else wrow
+    check('sync: workouts upsert on_conflict=log_id', 'on_conflict=log_id' in wpost[1], wpost[1])
+    want = {'log_id', 'revision', 'date', 'kind', 'status', 'source', 'summary', 'started_at', 'ended_at', 'duration_s', 'avg_hr', 'max_hr', 'min_hr',
+            'calories_kcal', 'zones_json', 'hrv_json', 'hr_trace_json', 'notes_raw', 'polar_json', 'user_id'}
+    check('sync: workouts row mirrors the coach schema', want <= set(wrow) and 'number' not in wrow and wrow['status'] == 'done' and wrow['source'] == 'pulse'
+          and wrow['kind'] == 'lower' and wrow['date'] == drow['date'] and wrow['polar_json']['log_id'] == wrow['log_id'], ','.join(sorted(want - set(wrow))))
+    check('sync: no raw RR uploaded', '"rr_ms"' not in wpost[2])
+    # delete propagates through the outbox as a soft delete on log_id
+    sid = wrow['log_id']
     await page.click('#del-session')
     await page.wait_for_timeout(1500)
     dels = [r for r in rest if r[0] in ('DELETE', 'PATCH')]
-    check('sync: delete -> remote delete samples/notes + soft-delete session', len(dels) >= 3 and any(r[0] == 'PATCH' and sid in r[1] for r in dels), str([(r[0], r[1].split('/rest/v1/')[1][:40]) for r in dels]))
+    check('sync: delete -> soft-delete workouts row by log_id', any(r[0] == 'PATCH' and '/rest/v1/workouts' in r[1] and sid in r[1] and 'deleted_at' in (r[2] or '') for r in dels),
+          str([(r[0], r[1].split('/rest/v1/')[1][:60]) for r in dels]))
+    # demo workouts never sync
+    n_workouts = len([r for r in rest if r[0] == 'POST' and '/rest/v1/workouts' in r[1]])
+    await page.goto(BASE + '#/')
+    await page.wait_for_selector('#demo-toggle')
+    await page.check('#demo-toggle')
+    await record('Upper A. Bench 3 by 5. Demo check.')
+    await page.wait_for_timeout(1500)
+    check('sync: demo workout is not pushed', len([r for r in rest if r[0] == 'POST' and '/rest/v1/workouts' in r[1]]) == n_workouts)
     await ctx.close()
 
 async def sw_check(browser, errors):
@@ -598,7 +679,8 @@ async def main():
             except Exception as e:
                 check(f'{flow.__name__} completed without exception', False, repr(e)[:400])
         await browser.close()
-    relevant = [e for e in errors if 'fonts.g' not in e]
+    # the retry flow aborts one coach request on purpose (simulated offline); Chromium logs that
+    relevant = [e for e in errors if 'fonts.g' not in e and not (e.startswith('[retry]') and 'ERR_INTERNET_DISCONNECTED' in e)]
     check('no console errors / page errors', not relevant, '\n'.join(relevant[:20]))
     failed = [r for r in results if not r[1]]
     print(f'\n{len(results) - len(failed)}/{len(results)} checks passed')
