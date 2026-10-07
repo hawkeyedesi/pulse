@@ -1,7 +1,7 @@
 // Pulse service worker: makes the app shell available offline.
 // Same-origin GETs: stale-while-revalidate (instant load, refreshed in the background).
 // Bump VERSION when you want every client to drop the old cache.
-const VERSION = 'pulse-v2';
+const VERSION = 'pulse-v3';
 const SHELL = [
   './', './index.html', './styles.css', './manifest.webmanifest',
   './js/app.js', './js/ble.js', './js/hr-parse.js', './js/notes-parser.js', './js/stats.js', './js/db.js',
