@@ -7,7 +7,10 @@ import { zoneFor, zoneBpmBounds, StatsAccumulator, kcalPerMinute, buildTrends, s
 import {
   readSse, buildMessages, sendChat, sendToSession, coachHeaders, sessionKeyIssue, autoSendEnabled, SESSION_KEY_HEADER,
 } from '../js/coach.js';
-import { downsampleHr, rrSummary, buildWorkoutLog, parseWorkoutLog, LOG_HEADER } from '../js/workout-log.js';
+import {
+  downsampleHr, rrSummary, buildWorkoutLog, parseWorkoutLog, LOG_HEADER, guessKind, isDemoSession, supabaseWorkoutRow, KINDS,
+} from '../js/workout-log.js';
+import { needsPush, sessionFromRow } from '../js/sync.js';
 import { createCoachSync } from '../js/coach-sync.js';
 import { spawn } from 'node:child_process';
 import http from 'node:http';
@@ -332,9 +335,13 @@ test('Workout log: header, instruction, human summary and fenced JSON', () => {
   const lines = log.text.split('\n');
   assert.equal(lines[0], LOG_HEADER);
   assert.equal(lines[1], `log_id: ${session.id} · revision: 1`);
-  assert.match(log.text, /save this workout to your workspace training log/);
-  assert.match(log.text, /fitness\/workouts\.md/);
+  assert.match(log.text, /map this into health\.sqlite3 per its existing write rules/);
+  assert.match(log.text, /upsert days for 2026-10-07 first, then upsert workouts by log_id/);
+  assert.match(log.text, /full JSON below in polar_json/);
+  assert.match(log.text, /do not insert demo/);
+  assert.match(log.text, /workout-log\.md updated as you already do/);
   assert.match(log.text, /2–3 sentence takeaway/);
+  assert.ok(!/fitness\/workouts/.test(log.text), 'old fitness/ file instruction is gone');
   for (const want of ['- When: ', '- Duration: 10:00 active (paused 1:00)', '- Heart rate: avg ', '- Time in zones: Z1 Warm-up', '- Calories: ~', '- Laps/sets (2)', '- Signal gaps: 1', '- RR/HRV', 'Bench press 4×8 @155 lb', 'effort 7/10', 'sleep ~6 h', 'flags: Shoulder tightness', '- Notes (raw): "Upper body day.']) {
     assert.ok(log.text.includes(want), `missing ${want}`);
   }
@@ -365,6 +372,117 @@ test('Workout log: header, instruction, human summary and fenced JSON', () => {
   assert.ok(!/"rr_ms"/.test(log.text), 'raw RR must not be sent');
   assert.ok(log.summary.startsWith(LOG_HEADER) && !log.summary.includes('```'));
   assert.ok(Buffer.byteLength(log.text) < 20 * 1024 * 1024);
+});
+
+const COACH_FIELDS = ['log_id', 'revision', 'date', 'kind', 'status', 'source', 'started_at', 'ended_at', 'duration_s',
+  'avg_hr', 'max_hr', 'min_hr', 'calories_kcal', 'zones', 'hrv', 'hr_trace', 'notes_raw', 'summary'];
+
+test('Workout log: top-level fields mirror the coach workouts row; no invented number', () => {
+  const { session, notes, samples } = fakeWorkout();
+  const data = parseWorkoutLog(buildWorkoutLog(session, notes, samples, SETTINGS, { revision: 3 }).text);
+  for (const k of COACH_FIELDS) assert.ok(k in data, `missing top-level ${k}`);
+  assert.ok(!('number' in data), 'session number is left for the coach');
+  assert.equal(data.revision, 3);
+  assert.equal(data.date, '2026-10-07');
+  assert.equal(data.date, data.started_at.slice(0, 10));
+  assert.equal(data.status, 'done');
+  assert.equal(data.source, 'pulse');
+  assert.equal(data.kind, 'other'); // upper-body notes that don't say A or B
+  assert.equal(data.duration_s, 600);
+  assert.equal(data.avg_hr, session.summary.avg);
+  assert.equal(data.max_hr, session.summary.max);
+  assert.equal(data.min_hr, session.summary.min);
+  assert.equal(data.calories_kcal, session.summary.calories);
+  assert.equal(data.notes_raw, notes.text);
+  assert.equal(data.zones.zones.length, 5);
+  assert.ok(data.hrv.rmssd_ms > 0);
+  assert.equal(data.hr_trace.interval_s, 5);
+  assert.ok(!data.summary.includes('\n') && data.summary.length < 300);
+  assert.match(data.summary, /^Other \(Strength\) · 10:00 · avg \d+\/max \d+ bpm · ~\d+ kcal · Bench press 4×8 @155 lb · effort 7\/10 · flags: Shoulder tightness$/);
+  assert.equal(data.session.source, 'ble'); // coach bridge checks session.source for demo
+  // explicit kind wins over the guess
+  const d2 = parseWorkoutLog(buildWorkoutLog({ ...session, kind: 'upper-b' }, notes, samples, SETTINGS).text);
+  assert.equal(d2.kind, 'upper-b');
+  assert.match(d2.summary, /^Upper B/);
+});
+
+test('Workout log: demo strap -> source demo and a do-not-insert instruction', () => {
+  const { session, notes, samples } = fakeWorkout({ seconds: 60 });
+  for (const demo of [{ ...session, source: 'demo' }, { ...session, demo: true }]) {
+    assert.equal(isDemoSession(demo), true);
+    const log = buildWorkoutLog(demo, notes, samples, SETTINGS);
+    const data = parseWorkoutLog(log.text);
+    assert.equal(data.source, 'demo');
+    assert.match(log.text, /DEMO \/ CONNECTION TEST/);
+    assert.match(log.text, /Do NOT insert it into health\.sqlite3/);
+    assert.ok(!/map this into health\.sqlite3/.test(log.text));
+    assert.match(data.summary, /DEMO \/ CONNECTION TEST$/);
+  }
+  assert.equal(isDemoSession(session), false);
+});
+
+test('Kind guess from dictated notes', () => {
+  const cases = [
+    ['Upper body day. Bench 4 sets of 8 at 155. Pull-ups 3 by 10.', 'other'],
+    ['Upper A today. Bench and rows.', 'upper-a'],
+    ['upper b, overhead press and pull-ups', 'upper-b'],
+    ['Workout B: rows and curls', 'upper-b'],
+    ['Day A. Bench press 5x5', 'upper-a'],
+    ['A good session, felt strong', 'other'],
+    ['Leg day. Squats 5 sets of 5 at 225. Romanian deadlifts 3 by 10.', 'lower'],
+    ['Walking lunges and leg press', 'lower'],
+    ['Easy zone 2 run, 5k on the treadmill', 'cardio'],
+    ['Row erg 20 minutes steady', 'cardio'],
+    ['Bike trainer intervals, legs felt tired', 'cardio'],
+    ['Bench then squats, full body', 'other'],
+    ['', 'other'],
+  ];
+  for (const [text, want] of cases) assert.equal(guessKind(text), want, text);
+  assert.equal(guessKind('', 'Run'), 'cardio');
+  assert.equal(guessKind('', 'Strength'), 'other');
+  assert.deepEqual(KINDS, ['upper-a', 'upper-b', 'lower', 'cardio', 'other']);
+});
+
+test('Supabase workouts row: coach columns + extras, upsert key log_id, no number, no raw RR', () => {
+  const { session, notes, samples } = fakeWorkout();
+  const data = parseWorkoutLog(buildWorkoutLog({ ...session, kind: 'upper-a' }, notes, samples, SETTINGS, { revision: 2 }).text);
+  const row = supabaseWorkoutRow(data, 'user-1');
+  assert.deepEqual(Object.keys(row).sort(), ['avg_hr', 'calories_kcal', 'date', 'deleted_at', 'duration_s', 'ended_at', 'hr_trace_json', 'hrv_json',
+    'kind', 'log_id', 'max_hr', 'min_hr', 'notes_raw', 'polar_json', 'revision', 'source', 'started_at', 'status', 'summary', 'user_id', 'zones_json'].sort());
+  assert.equal(row.log_id, session.id);
+  assert.equal(row.revision, 2);
+  assert.equal(row.kind, 'upper-a');
+  assert.equal(row.source, 'pulse');
+  assert.equal(row.polar_json, data);
+  assert.ok(!/"rr_ms"/.test(JSON.stringify(row)), 'raw RR never stored');
+  assert.ok(!('user_id' in supabaseWorkoutRow(data)));
+});
+
+test('Sync: demo never pushed; v2 bookkeeping; rows rebuild a local session', () => {
+  const base = { id: 'x', status: 'complete', updatedAt: 10 };
+  assert.equal(needsPush(base), true);
+  assert.equal(needsPush({ ...base, syncedAt: 10 }), true, 'v1 syncedAt does not count: re-push into workouts');
+  assert.equal(needsPush({ ...base, cloudSyncedAt: 10 }), false);
+  assert.equal(needsPush({ ...base, cloudSyncedAt: 5 }), true);
+  assert.equal(needsPush({ ...base, source: 'demo' }), false);
+  assert.equal(needsPush({ ...base, demo: true }), false);
+  assert.equal(needsPush({ ...base, status: 'active' }), false);
+  const { session, notes, samples } = fakeWorkout();
+  const data = parseWorkoutLog(buildWorkoutLog({ ...session, kind: 'lower' }, notes, samples, SETTINGS).text);
+  const row = { ...supabaseWorkoutRow(data), updated_at: '2026-10-07T19:00:00Z', number: 12 };
+  const r = sessionFromRow(row, SETTINGS);
+  assert.equal(r.session.id, session.id);
+  assert.equal(r.session.kind, 'lower');
+  assert.equal(r.session.startedAt, session.startedAt);
+  assert.equal(r.session.durationS, 600);
+  assert.equal(r.session.summary.avg, session.summary.avg);
+  assert.equal(r.session.cloudSyncedAt, r.session.updatedAt);
+  assert.equal(needsPush(r.session), false);
+  assert.equal(r.samples.length, data.hr_trace.points.length);
+  assert.ok(r.samples.every((x) => x.rr_ms.length === 0));
+  assert.equal(r.notes.text, notes.text);
+  assert.equal(r.session.laps.length, 1);
+  assert.deepEqual(r.session.gaps.map((g) => [g.startElapsed, g.endElapsed]), [[100, 112]]);
 });
 
 test('Workout log: no notes, no RR, no calories -> fields null and summary says so', () => {
@@ -463,6 +581,49 @@ test('Coach sync: a deleted session is not sent', async () => {
   const cs = createCoachSync({ db, getSettings: () => COACH, isConfigured: () => true, buildLog: buildWorkoutLog, send: async () => { calls++; return ''; } });
   await cs.retryAll();
   assert.equal(calls, 0);
+});
+
+test('Coach sync: demo sessions are never auto-sent or retried; manual send allowed and marked demo', async () => {
+  const { session, notes, samples } = fakeWorkout({ seconds: 60 });
+  session.id = 'd1'; session.source = 'demo';
+  const db = memDb({ sessions: [session], notes: [{ ...notes, sessionId: 'd1' }], samples: samples.map((x) => ({ ...x, sessionId: 'd1' })) });
+  const sent = [];
+  let fail = false;
+  const cs = createCoachSync({ db, getSettings: () => ({ ...COACH, ...SETTINGS }), isConfigured: () => true, buildLog: buildWorkoutLog,
+    send: async (s, text) => { sent.push(text); if (fail) throw new Error('down'); return 'Got the connection test.'; } });
+  assert.equal(await cs.queue('d1'), null, 'demo is never queued');
+  assert.equal(await cs.sendNow('d1'), null, 'automatic send is a no-op for demo');
+  assert.equal(sent.length, 0);
+  fail = true;
+  assert.equal((await cs.sendNow('d1', { manual: true })).status, 'failed');
+  assert.equal(await cs.retryAll(), 0, 'failed demo send is not retried automatically');
+  assert.equal(sent.length, 1);
+  fail = false;
+  assert.equal((await cs.sendNow('d1', { manual: true })).status, 'sent');
+  const data = parseWorkoutLog(sent[1]);
+  assert.equal(data.source, 'demo');
+  assert.match(sent[1], /Do NOT insert/);
+});
+
+test('Coach sync: kind edit bumps revision and force re-queues a sent log', async () => {
+  const { session, samples } = fakeWorkout({ seconds: 60 });
+  session.id = 'k1';
+  const db = memDb({ sessions: [session], samples: samples.map((x) => ({ ...x, sessionId: 'k1' })) });
+  const sent = [];
+  const cs = createCoachSync({ db, getSettings: () => ({ ...COACH, ...SETTINGS }), isConfigured: () => true, buildLog: buildWorkoutLog,
+    send: async (s, text) => { sent.push(parseWorkoutLog(text)); return 'ok'; } });
+  await cs.queue('k1');
+  assert.equal((await cs.sendNow('k1')).status, 'sent');
+  assert.deepEqual([sent[0].revision, sent[0].kind], [1, 'other']);
+  // what the session page does on a kind change
+  await db.put('sessions', { ...(await db.get('sessions', 'k1')), kind: 'upper-b', revision: 2 });
+  assert.equal((await cs.queue('k1')).status, 'sent', 'plain queue is still a no-op after success');
+  assert.equal((await cs.queue('k1', { force: true })).status, 'pending');
+  assert.equal(await cs.retryAll(), 1);
+  assert.deepEqual([sent[1].revision, sent[1].kind, sent[1].log_id], [2, 'upper-b', 'k1']);
+  // revision never goes backwards: later manual resend -> 3
+  await cs.sendNow('k1', { manual: true });
+  assert.equal(sent[2].revision, 3);
 });
 
 // ---------------------------------------------------------------- coach-proxy.mjs
