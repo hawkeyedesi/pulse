@@ -10,6 +10,12 @@
 //   ```json
 //   { format: "pulse-workout-log", version: 1, ... }   <- structured data
 //   ```
+//
+// The JSON's top-level fields mirror the coach's OpenClaw health.sqlite3 `workouts` row
+// (date, kind, status, summary, plus the suggested extras log_id, revision, source,
+// started_at, ended_at, duration_s, avg/max/min_hr, calories_kcal, zones, hrv, hr_trace,
+// notes_raw). `number` (session number) is deliberately absent: the coach assigns it.
+// The whole JSON is what the coach stores in polar_json.
 
 import { fmtDuration, zoneBpmBounds, ZONE_NAMES, lapStats, DEFAULT_SETTINGS } from './stats.js';
 
@@ -96,6 +102,42 @@ export function rrSummary(samples, { minCount = 20 } = {}) {
   };
 }
 
+// ---------------------------------------------------------------- kind (coach workouts.kind)
+export const KINDS = ['upper-a', 'upper-b', 'lower', 'cardio', 'other'];
+export const KIND_LABELS = { 'upper-a': 'Upper A', 'upper-b': 'Upper B', lower: 'Lower', cardio: 'Cardio', other: 'Other' };
+
+/** Demo-strap / demo-history sessions are never auto-sent to the coach or synced. */
+export function isDemoSession(session) {
+  return !!(session && (session.demo || session.source === 'demo'));
+}
+
+/**
+ * Guess the coach `kind` from dictated notes (and the start-screen type as a fallback).
+ * Upper A / B only when the notes name it ("upper A", "day B", "workout A"); an upper-body
+ * session that does not say which stays 'other' so the user picks.
+ */
+export function guessKind(text, type = null) {
+  const raw = String(text || '');
+  let t = ` ${raw.toLowerCase()} `;
+  const cardio = /\b(row(ing)? ?erg|erg|rowing machine|zone ?2|z2|run|running|jog|jogging|treadmill|bike|biking|cycling|cycle|spin|elliptical|stair ?master|swim|swimming|cardio|walk|hike)\b/.test(t);
+  t = t.replace(/\b(row(ing)? ?erg|rowing machine)\b/g, ' ');
+  const lowerStrong = /\b(squats?|deadlifts?|rdls?|lunges?|leg day|leg press|lower body|hip thrusts?|step[- ]?ups?|calf raises?|split squats?|good mornings?)\b/.test(t);
+  const lowerWeak = /\b(legs?|hamstrings?|quads?|glutes?)\b/.test(t);
+  t = t.replace(/\bleg (press|curls?|extensions?)\b/g, ' ');
+  const upperHit = /\b(bench|press(es)?|ohp|rows?|pull[- ]?ups?|pulls?|pulldowns?|lat ?pull ?downs?|chin[- ]?ups?|push[- ]?ups?|dips|curls?|triceps|biceps|chest|upper body|upper day)\b/.test(t);
+  const sayA = /\bupper[\s-]*a\b/i.test(raw) || /\b([Dd]ay|[Ww]orkout|[Ss]ession|[Tt]emplate|[Pp]lan|[Rr]outine)[\s-]+A\b/.test(raw);
+  const sayB = /\bupper[\s-]*b\b/i.test(raw) || /\b([Dd]ay|[Ww]orkout|[Ss]ession|[Tt]emplate|[Pp]lan|[Rr]outine)[\s-]+B\b/.test(raw);
+  if (sayA && !sayB) return 'upper-a';
+  if (sayB && !sayA) return 'upper-b';
+  if (cardio && !upperHit && !lowerStrong) return 'cardio';
+  const lowerHit = lowerStrong || lowerWeak;
+  if (upperHit && lowerHit) return 'other';
+  if (lowerHit) return 'lower';
+  if (upperHit) return 'other'; // upper, but A vs B unknown: let the user pick
+  if (['Run', 'Cycling'].includes(type)) return 'cardio';
+  return 'other';
+}
+
 function zoneTable(summary, settings) {
   const secs = summary?.zones || [0, 0, 0, 0, 0];
   const total = secs.reduce((a, b) => a + b, 0);
@@ -131,25 +173,66 @@ function pausedSeconds(session) {
   return Math.round((session.pauses || []).reduce((a, p) => a + Math.max(0, (p.end ?? p.start) - p.start), 0) / 1000);
 }
 
+/** One-line summary for workouts.summary. */
+export function oneLineSummary(data) {
+  const parts = [KIND_LABELS[data.kind] || 'Workout'];
+  if (data.session?.type) parts[0] += ` (${data.session.type})`;
+  parts.push(fmtDuration(data.duration_s || 0));
+  if (data.avg_hr != null) parts.push(`avg ${data.avg_hr}/max ${data.max_hr ?? '–'} bpm`);
+  if (data.calories_kcal != null) parts.push(`~${data.calories_kcal} kcal`);
+  const f = data.notes?.fields;
+  if (f?.exercises?.length) parts.push(f.exercises.map((e) => e.label).join(', '));
+  if (f?.effort != null) parts.push(`effort ${f.effort}/10`);
+  if (f?.flags?.length) parts.push(`flags: ${f.flags.join(', ')}`);
+  if (data.source === 'demo') parts.push('DEMO / CONNECTION TEST');
+  return parts.join(' · ');
+}
+
 /** Structured JSON part of the log. */
 export function workoutLogData(session, notes, samples, settings, { revision = 1, now = Date.now() } = {}) {
   const s = session.summary || {};
   const laps = lapStats(samples || [], session.laps || []);
   const n = notesFields(notes);
-  return {
+  const startedAt = isoLocal(session.startedAt);
+  const endedAt = session.endedAt ? isoLocal(session.endedAt) : null;
+  const demo = isDemoSession(session);
+  const kind = KINDS.includes(session.kind) ? session.kind : guessKind(notes?.text, session.type);
+  const zones = zoneTable(s, settings);
+  const hrv = rrSummary(samples);
+  const d = downsampleHr(samples);
+  const hrTrace = { interval_s: d.interval_s, aggregation: 'mean', time_base: 'active elapsed seconds (pauses excluded)', columns: ['t_s', 'hr'], points: d.points };
+  const data = {
     format: LOG_FORMAT,
     version: LOG_VERSION,
     log_id: session.id,
     revision,
     generated_at: isoLocal(now),
+    // ---- coach health.sqlite3 `workouts` columns (number is left for the coach to assign)
+    date: startedAt.slice(0, 10),
+    kind,
+    status: 'done',
+    source: demo ? 'demo' : 'pulse',
+    started_at: startedAt,
+    ended_at: endedAt,
+    duration_s: Math.round(session.durationS || 0),
+    avg_hr: s.avg ?? null,
+    max_hr: s.max ?? null,
+    min_hr: s.min ?? null,
+    calories_kcal: s.calories ?? null,
+    summary: '',
+    notes_raw: n?.text || null,
+    zones,
+    hrv,
+    hr_trace: hrTrace,
+    // ---- full Pulse detail
     session: {
       id: session.id,
       type: session.type || n?.fields.type || null,
       source: session.source || 'ble',
       device: session.device?.name || null,
       timezone: localTimeZone(),
-      started_at: isoLocal(session.startedAt),
-      ended_at: session.endedAt ? isoLocal(session.endedAt) : null,
+      started_at: startedAt,
+      ended_at: endedAt,
       duration_s: Math.round(session.durationS || 0),
       paused_s: pausedSeconds(session),
       avg_hr: s.avg ?? null, max_hr: s.max ?? null, min_hr: s.min ?? null,
@@ -161,14 +244,26 @@ export function workoutLogData(session, notes, samples, settings, { revision = 1
         .map((g) => ({ start_s: g.startElapsed, end_s: g.endElapsed ?? g.startElapsed })),
       sample_count: (samples || []).length,
     },
-    zones: zoneTable(s, settings),
     notes: n,
-    hrv: rrSummary(samples),
-    hr_trace: (() => {
-      const d = downsampleHr(samples);
-      return { interval_s: d.interval_s, aggregation: 'mean', time_base: 'active elapsed seconds (pauses excluded)', columns: ['t_s', 'hr'], points: d.points };
-    })(),
   };
+  data.summary = oneLineSummary(data);
+  return data;
+}
+
+/**
+ * Supabase `workouts` row (mirrors the coach DB). `number` is omitted so an upsert never
+ * clears the coach-assigned session number. No raw RR: hrv is the summary only.
+ */
+export function supabaseWorkoutRow(data, userId = undefined) {
+  const row = {
+    log_id: data.log_id, revision: data.revision, date: data.date, kind: data.kind, status: data.status,
+    source: data.source, summary: data.summary, started_at: data.started_at, ended_at: data.ended_at,
+    duration_s: data.duration_s, avg_hr: data.avg_hr, max_hr: data.max_hr, min_hr: data.min_hr,
+    calories_kcal: data.calories_kcal, zones_json: data.zones, hrv_json: data.hrv, hr_trace_json: data.hr_trace,
+    notes_raw: data.notes_raw, polar_json: data, deleted_at: null,
+  };
+  if (userId) row.user_id = userId;
+  return row;
 }
 
 function humanSummary(data, settings) {
@@ -181,7 +276,7 @@ function humanSummary(data, settings) {
   when += ` (${ss.timezone})`;
   const lines = [];
   lines.push(`- When: ${when}`);
-  lines.push(`- Type: ${ss.type || 'Unspecified'}`);
+  lines.push(`- Kind: ${KIND_LABELS[data.kind] || data.kind} · Type: ${ss.type || 'Unspecified'} · Date: ${data.date}`);
   lines.push(`- Duration: ${fmtDuration(ss.duration_s)} active${ss.paused_s ? ` (paused ${fmtDuration(ss.paused_s)})` : ''}`);
   lines.push(`- Heart rate: avg ${ss.avg_hr ?? '–'} bpm, max ${ss.max_hr ?? '–'} bpm, min ${ss.min_hr ?? '–'} bpm (max HR setting ${ss.max_hr_setting ?? settings.maxHr})`);
   lines.push('- Time in zones: ' + data.zones.zones.map((z) => {
@@ -212,10 +307,15 @@ function humanSummary(data, settings) {
 }
 
 export function coachInstruction(data) {
-  const day = data.session.started_at.slice(0, 10);
-  return `Coach: please save this workout to your workspace training log (for example append a summary entry to fitness/workouts.md and store the JSON below as fitness/workouts/${day}-${data.log_id.slice(0, 8)}.json). `
-    + `Use log_id to avoid duplicates: if this log_id is already saved, update that entry instead of adding a new one. `
-    + 'Then reply with a 2–3 sentence takeaway for me.';
+  if (data.source === 'demo') {
+    return 'Coach: this is a DEMO / CONNECTION TEST recorded with the simulated strap (source=demo). '
+      + 'Do NOT insert it into health.sqlite3 (no days or workouts row), do not add it to workout-log.md, and do not change the training plan. '
+      + 'Just reply with 1–2 sentences confirming you received it.';
+  }
+  return `Coach: map this into health.sqlite3 per its existing write rules: upsert days for ${data.date} first, then upsert workouts by log_id `
+    + `(same log_id = update that row, never a duplicate; status done; kind ${data.kind}; you assign the session number), `
+    + 'store the full JSON below in polar_json, and do not insert demo sessions. '
+    + 'Keep workout-log.md updated as you already do. Then reply with a 2–3 sentence takeaway for me.';
 }
 
 /**
