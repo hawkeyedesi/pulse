@@ -7,6 +7,13 @@
 // anything here runs, and every failure only marks the record 'failed' for a later retry
 // (next app open, coming back online, or the "Send to coach" button).
 //
+// Demo sessions (demo strap / demo history) are never sent automatically: queue() and
+// retryAll() skip them. A manual send (sendNow(id, { manual: true })) is still allowed;
+// the payload then says source=demo and tells the coach not to insert it.
+//
+// Revision: max(session.revision, sends so far + 1), so a kind edit (which bumps
+// session.revision) and every manual re-send both reach the coach as a newer revision.
+//
 // Dependencies are injected so this runs in Node tests with an in-memory db.
 
 export const STORE = 'coachlog';
@@ -21,8 +28,12 @@ const RETRYABLE = new Set(['pending', 'failed', 'sending']);
  * @param {(session, notes, samples, settings, opts) => {text, summary}} deps.buildLog
  * @param {() => boolean} [deps.online]
  * @param {() => number} [deps.now]
+ * @param {(session) => boolean} [deps.isDemo]
  */
-export function createCoachSync({ db, send, getSettings, isConfigured, buildLog, online = () => true, now = () => Date.now() }) {
+export function createCoachSync({
+  db, send, getSettings, isConfigured, buildLog, online = () => true, now = () => Date.now(),
+  isDemo = (s) => !!(s && (s.demo || s.source === 'demo')),
+}) {
   const inflight = new Map();
   const listeners = new Set();
   const emit = (sessionId, rec) => listeners.forEach((fn) => { try { fn(sessionId, rec); } catch (e) { console.warn(e); } });
@@ -31,10 +42,16 @@ export function createCoachSync({ db, send, getSettings, isConfigured, buildLog,
 
   async function save(rec) { await db.put(STORE, rec); emit(rec.sessionId, rec); return rec; }
 
-  /** Mark a session as waiting to be sent (no-op if already sent). */
-  async function queue(sessionId) {
+  /**
+   * Mark a session as waiting to be sent (no-op if already sent, unless force — used when
+   * the session changed after it was sent, e.g. its kind was edited). Demo sessions are
+   * never queued (returns null).
+   */
+  async function queue(sessionId, { force = false } = {}) {
+    const session = await db.get('sessions', sessionId);
+    if (isDemo(session)) return null;
     const rec = await status(sessionId);
-    if (rec?.status === 'sent') return rec;
+    if (rec?.status === 'sent' && !force) return rec;
     return save({ attempts: 0, sentCount: 0, ...(rec || {}), sessionId, status: 'pending', queuedAt: now() });
   }
 
@@ -51,12 +68,13 @@ export function createCoachSync({ db, send, getSettings, isConfigured, buildLog,
    * Send one workout now. Concurrent calls for the same session share one request.
    * Resolves with the final record (never rejects).
    */
-  function sendNow(sessionId) {
+  function sendNow(sessionId, { manual = false } = {}) {
     if (inflight.has(sessionId)) return inflight.get(sessionId);
     const p = (async () => {
       const settings = getSettings();
       const session = await db.get('sessions', sessionId);
       if (!session || session.deleted || session.status !== 'complete') return status(sessionId);
+      if (isDemo(session) && !manual) return status(sessionId); // demo: only on an explicit tap
       const prev = (await status(sessionId)) || { sessionId, attempts: 0, sentCount: 0, queuedAt: now() };
       if (!isConfigured(settings) || !online()) {
         return save({ ...prev, status: prev.status === 'sent' ? 'sent' : 'pending' });
@@ -64,7 +82,7 @@ export function createCoachSync({ db, send, getSettings, isConfigured, buildLog,
       let rec = await save({ ...prev, status: 'sending', lastAttemptAt: now(), attempts: (prev.attempts || 0) + 1 });
       try {
         const [notes, samples] = await Promise.all([db.get('notes', sessionId), db.getSamples(sessionId)]);
-        const log = buildLog(session, notes, samples, settings, { revision: (prev.sentCount || 0) + 1, now: now() });
+        const log = buildLog(session, notes, samples, settings, { revision: Math.max(session.revision || 1, (prev.sentCount || 0) + 1), now: now() });
         const reply = await send(settings, log.text);
         if (!(await db.get('sessions', sessionId))) return null; // deleted meanwhile
         await appendChat(sessionId, log.summary, reply);
@@ -87,6 +105,7 @@ export function createCoachSync({ db, send, getSettings, isConfigured, buildLog,
       .sort((a, b) => (a.queuedAt || 0) - (b.queuedAt || 0));
     let ok = 0;
     for (const r of all) {
+      if (isDemo(await db.get('sessions', r.sessionId))) continue; // never auto-retry demo sends
       const res = await sendNow(r.sessionId);
       if (res?.status === 'sent') ok++;
     }
