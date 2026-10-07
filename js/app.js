@@ -17,7 +17,7 @@ import {
   autoSendEnabled, coachSessionKey, sessionKeyIssue,
 } from './coach.js';
 import { createCoachSync } from './coach-sync.js';
-import { buildWorkoutLog } from './workout-log.js';
+import { buildWorkoutLog, guessKind, KINDS, KIND_LABELS, isDemoSession } from './workout-log.js';
 import { generateDemoHistory, removeDemoHistory } from './demo.js';
 
 const TYPES = ['Strength', 'Run', 'Cycling', 'HIIT', 'Yoga', 'Other'];
@@ -39,6 +39,7 @@ const state = {
   redraw: null, // function to redraw the current screen's charts
   liveTimer: null,
   coach: null,
+  kind: { sessionId: null, value: 'other', manual: false }, // kind picker on the notes screen
 };
 state.recorder = new Recorder(state.settings);
 
@@ -56,8 +57,8 @@ const coachSync = createCoachSync({
 async function afterWorkoutSaved(id) {
   if (!autoSendEnabled(state.settings)) return;
   try {
-    const rec = await coachSync.queue(id);
-    if (rec?.status !== 'sent') coachSync.sendNow(id); // fire and forget; never blocks the UI
+    const rec = await coachSync.queue(id); // null for demo sessions: never auto-sent
+    if (rec && rec.status !== 'sent') coachSync.sendNow(id); // fire and forget; never blocks the UI
   } catch (e) { console.warn('could not queue coach log', e); }
 }
 
@@ -427,6 +428,9 @@ async function renderNotes(id) {
   const ta = $('#notes-text');
   ta.value = existing?.text || '';
   ta.dataset.sessionId = id;
+  state.kind = KINDS.includes(session.kind)
+    ? { sessionId: id, value: session.kind, manual: true, type: session.type }
+    : { sessionId: id, value: guessKind(ta.value, session.type), manual: false, type: session.type };
   updateParsed();
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   $('#mic-btn').dataset.mode = SR ? 'speech' : 'keyboard';
@@ -439,7 +443,31 @@ function updateParsed() {
   $('#parsed-chips').innerHTML = parsed.chips.length
     ? parsed.chips.map((c) => `<span class="pchip pchip-${c.kind}">${esc(c.label)}</span>`).join('')
     : '<span class="muted">Type, exercises, sets × reps, effort, sleep and aches will show up here as you dictate.</span>';
+  if (!state.kind.manual) state.kind.value = guessKind(text, state.kind.type);
+  renderKindChips();
   return parsed;
+}
+
+function renderKindChips() {
+  const box = $('#kind-chips');
+  if (!box) return;
+  box.innerHTML = KINDS.map((k) => {
+    const on = state.kind.value === k;
+    return `<button type="button" class="chip-btn${on ? ' on' : ''}" data-kind="${k}" role="radio" aria-checked="${on}">${KIND_LABELS[k]}</button>`;
+  }).join('');
+  const hint = $('#kind-hint');
+  if (hint) hint.textContent = state.kind.manual ? '' : state.kind.value === 'other' ? 'Pick one if this was Upper A, Upper B, Lower or Cardio.' : 'Guessed from your notes. Tap to change.';
+}
+
+/** Store the picked kind on the session (before the coach send / sync read it). */
+async function saveKind(id) {
+  const session = await db.get('sessions', id);
+  if (!session || state.kind.sessionId !== id) return;
+  if (session.kind !== state.kind.value) {
+    session.kind = state.kind.value;
+    session.updatedAt = Date.now();
+    await db.put('sessions', session);
+  }
 }
 
 function toggleDictation() {
@@ -485,6 +513,7 @@ async function saveNotes() {
   const session = await db.get('sessions', id);
   if (session) {
     if (!session.type && parsed.type) session.type = parsed.type;
+    if (state.kind.sessionId === id) session.kind = state.kind.value;
     session.updatedAt = Date.now();
     await db.put('sessions', session);
   }
@@ -510,19 +539,23 @@ async function renderSession(id) {
   const laps = lapStats(samples, session.laps);
   const justSaved = state.justSaved === id;
   state.justSaved = null;
-  const autoSend = autoSendEnabled(s);
+  const demo = isDemoSession(session);
+  const autoSend = autoSendEnabled(s) && !demo;
+  const kind = KINDS.includes(session.kind) ? session.kind : null;
   const el = $('#screen-session');
   el.innerHTML = `
-    ${justSaved ? `<div class="banner ok"><div><strong>Workout saved.</strong> <span id="saved-coach-note">${!coachConfigured(s) ? 'Set up your coach in Settings to get feedback.' : autoSend ? 'Sending it to your coach…' : 'Want your coach’s take?'}</span></div>
+    ${justSaved ? `<div class="banner ok"><div><strong>Workout saved.</strong> <span id="saved-coach-note">${!coachConfigured(s) ? 'Set up your coach in Settings to get feedback.' : demo ? 'Demo workout: not sent to your coach automatically (a manual send is marked demo so it isn’t logged).' : autoSend ? 'Sending it to your coach…' : 'Want your coach’s take?'}</span></div>
       <div class="banner-actions">${!coachConfigured(s) ? '<a class="btn small" href="#/settings">Coach settings</a>' : autoSend ? '' : '<button class="btn small primary" id="send-coach">Send to coach</button>'}</div></div>` : ''}
     <div class="page-head">
       <div>
         <div class="eyebrow">${session.status === 'active' ? 'In progress' : 'Workout'}</div>
         <h1>${esc(fmtDate(session.startedAt))} · ${esc(session.type || 'Workout')} · ${fmtDuration(session.durationS)}</h1>
+        ${demo ? '<span class="chip chip-quiet" id="demo-badge">Demo</span>' : ''}
         <div class="muted">${new Date(session.startedAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })} · ${esc(session.device?.name || '')}${session.gaps?.length ? ` · ${session.gaps.length} signal gap${session.gaps.length > 1 ? 's' : ''}` : ''}</div>
         <div id="coach-log-status" class="coach-log-status"></div>
       </div>
       <div class="head-actions">
+        <select id="session-kind" aria-label="Workout kind (coach log)">${[['', 'Set kind…'], ...KINDS.map((k) => [k, KIND_LABELS[k]])].map(([v, l]) => `<option value="${v}"${(kind || '') === v ? ' selected' : ''}>${l}</option>`).join('')}</select>
         <select id="session-type" aria-label="Workout type">${['', ...TYPES].map((t) => `<option value="${t}"${(session.type || '') === t ? ' selected' : ''}>${t || 'Set type…'}</option>`).join('')}</select>
         <button class="btn" id="open-coach">Coach</button>
       </div>
@@ -568,7 +601,7 @@ async function renderSession(id) {
   $('#del-session').onclick = async () => {
     if (!confirm('Delete this workout and all its heart-rate data? This can’t be undone.')) return;
     const fresh = await db.get('sessions', id);
-    await sync.queueRemoteDelete(id, !!fresh?.syncedAt || sync.syncConfigured());
+    await sync.queueRemoteDelete(id, !!fresh?.cloudSyncedAt || sync.syncConfigured());
     await db.deleteSessionLocal(id);
     sync.syncNow();
     toast('Workout deleted');
@@ -577,6 +610,23 @@ async function renderSession(id) {
   $('#session-type').onchange = async (e) => {
     session.type = e.target.value || null; session.updatedAt = Date.now();
     await db.put('sessions', session); sync.syncNow(); toast('Type updated');
+  };
+  $('#session-kind').onchange = async (e) => {
+    const fresh = await db.get('sessions', id);
+    if (!fresh || !e.target.value || fresh.kind === e.target.value) return;
+    fresh.kind = e.target.value;
+    fresh.revision = (fresh.revision || 1) + 1;
+    fresh.updatedAt = Date.now();
+    await db.put('sessions', fresh);
+    Object.assign(session, fresh);
+    sync.syncNow();
+    // Re-send the new revision so the coach updates its row (same log_id). Demo: never automatic.
+    if (coachConfigured(state.settings) && !isDemoSession(fresh)) {
+      await coachSync.queue(id, { force: true });
+      coachSync.sendNow(id);
+      renderCoachLogStatus(id);
+      toast(`Kind: ${KIND_LABELS[fresh.kind]} · re-sending to coach`);
+    } else toast(`Kind: ${KIND_LABELS[fresh.kind]}`);
   };
   $('#open-coach').onclick = () => openCoach({ sessionId: id });
   const sc = $('#send-coach');
@@ -593,7 +643,7 @@ const COACH_CHIP = {
 };
 
 function sendWorkoutLog(id) {
-  coachSync.sendNow(id);
+  coachSync.sendNow(id, { manual: true });
   renderCoachLogStatus(id);
 }
 
@@ -1047,8 +1097,16 @@ function bindStatic() {
   $('#notes-text').addEventListener('input', debounce(updateParsed, 200));
   $('#mic-btn').addEventListener('click', toggleDictation);
   $('#save-notes').addEventListener('click', saveNotes);
+  $('#kind-chips').addEventListener('click', (e) => {
+    const b = e.target.closest('[data-kind]');
+    if (!b) return;
+    state.kind.value = b.dataset.kind;
+    state.kind.manual = true;
+    renderKindChips();
+  });
   $('#skip-notes').addEventListener('click', async () => {
     const id = $('#notes-text').dataset.sessionId;
+    await saveKind(id);
     state.justSaved = id;
     await afterWorkoutSaved(id);
     go(`#/session/${id}`);
