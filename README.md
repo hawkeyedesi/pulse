@@ -81,16 +81,21 @@ Turn on **Demo strap** on the Start screen, open `?demo=1`, or go to **Settings 
 ## 3. Supabase sync (optional)
 
 1. Create a project at <https://supabase.com> (the free tier is fine).
-2. Go to **SQL Editor → New query**, paste `supabase/schema.sql`, and click **Run**. This creates `sessions`, `samples` and `notes`, with indexes and RLS policies so only the signed-in owner (`auth.uid()`) can read or write rows.
+2. Go to **SQL Editor → New query**, paste `supabase/schema.sql`, and click **Run**. This creates `days`, `workouts`, `meals` and `weigh_ins`, the same tables the coach keeps in OpenClaw's `health.sqlite3` (plus a uuid `id`, a `user_id` and RLS policies so only the signed-in owner, `auth.uid()`, can read or write rows). `workouts` has the coach columns (`date` → `days`, `number`, `kind`, `status`, `summary`, `polar_json`) and the extras (`log_id` UNIQUE, `revision`, `source`, `started_at`/`ended_at`, `duration_s`, `avg_hr`/`max_hr`/`min_hr`, `calories_kcal`, `zones_json`, `hrv_json`, `hr_trace_json`, `notes_raw`), plus `updated_at`/`deleted_at` for sync. Re-running the script is safe.
 3. Go to **Authentication → Sign In / Providers** and make sure **Email** is enabled (it is by default).
 4. Go to **Authentication → URL Configuration**. Set **Site URL** to `https://<your-user>.github.io/pulse/` and add the same URL, plus `http://localhost:8000/` if you test locally, to **Redirect URLs**.
 5. **Recommended for iPhone:** go to **Authentication → Emails → Magic Link** and add the one-time code to the template, for example `<p>Or enter this code in Pulse: <strong>{{ .Token }}</strong></p>`. On iPhone, a magic link opens in Safari, not Bluefy, so the session would end up in the wrong browser. Typing the 6-digit code into Pulse in Bluefy signs in Bluefy.
 6. In **Project Settings → API**, copy the **Project URL** and the **anon / publishable key**. Paste them into Pulse under **Settings → Sync**, enter your email, then tap **Email me a sign-in link** and use the link (desktop) or the code (iPhone).
 
 How sync behaves:
-- Finished workouts are pushed whenever you're online and signed in: when you save, when the browser comes back online, and every 5 minutes. Unsynced workouts wait in the local queue.
-- Deleting a workout removes its samples and notes remotely and soft-deletes the session (`deleted_at`), so your other devices remove it too on their next sync.
-- Workouts from your other devices are pulled down, samples included.
+- IndexedDB on the device stays the source of truth (local-first). Finished workouts are pushed whenever you're online and signed in: when you save, when the browser comes back online, and every 5 minutes. Unsynced workouts wait in the local queue.
+- Each push follows the coach's write rules: upsert the `days` row for the workout's local date first (Pulse never touches that day's `notes`), then upsert the `workouts` row **on `log_id`**, so a re-push (for example after you change the kind) updates the same row instead of adding a duplicate. Pulse writes `status = 'done'`, `source = 'pulse'`, its `revision`, the one-line `summary` and the full workout JSON in `polar_json`. It never sends `number`, so the session number the coach assigns is kept.
+- **Demo workouts never sync** (demo strap or demo history). They stay on the device.
+- **Raw RR intervals are never uploaded.** `hrv_json` is the whole-session summary (RMSSD, SDNN, pNN50) and `hr_trace_json` is the heart rate averaged into 5-second buckets.
+- Deleting a workout soft-deletes its row (`deleted_at`), so your other devices remove it on their next sync.
+- Pulse workouts from your other devices are pulled down and rebuilt from `polar_json` and the 5-second trace (so their charts are 5-second resolution, without RR).
+- `meals` and `weigh_ins` are there for the coach; Pulse doesn't write them.
+- Upgrading from the v1 schema (`sessions`/`samples`/`notes`): run the new script, and each device re-pushes its local workouts into `workouts` on its next sync. The old tables are then unused; the bottom of `schema.sql` shows how to drop them.
 - The anon key is meant to be public. RLS is what protects the data.
 
 ---
@@ -196,10 +201,13 @@ Pulse can talk to **one specific, existing OpenClaw session**, such as the Teleg
 3. **Send each workout to coach automatically** (Settings → Coach) is on by default once a session key is set in Pulse. If you only set the key on the proxy, tick it yourself.
 
 What happens when you save a workout (Save notes or Skip):
-- The workout, samples and notes are written to IndexedDB first. Then Pulse posts one **non-streaming** message (`stream: false`) into the session: a `PULSE WORKOUT LOG v1` header, an instruction asking the coach to save the log to its workspace (e.g. `fitness/workouts.md` plus `fitness/workouts/<date>-<id>.json`) and reply with a 2–3 sentence takeaway, a human summary, and a fenced `json` block with the structured data (session metadata, zone totals, parsed notes + raw note text, RR/HRV summary such as RMSSD, and the heart rate averaged into 5-second buckets; raw RR intervals are not sent). The `log_id` (the workout's id) lets the coach update instead of duplicating when a log is re-sent.
+- The workout, samples and notes are written to IndexedDB first. Then Pulse posts one **non-streaming** message (`stream: false`) into the session: a `PULSE WORKOUT LOG v1` header, an instruction asking the coach to map it into its existing `health.sqlite3` per its write rules (upsert `days`, upsert `workouts` by `log_id`, full JSON in `polar_json`, never insert demo) and keep its `workout-log.md` updated as it already does, then reply with a 2–3 sentence takeaway; a human summary; and a fenced `json` block.
+- The JSON's top-level fields match a coach `workouts` row: `log_id`, `revision`, `date` (local YYYY-MM-DD of the start), `kind` (`upper-a` | `upper-b` | `lower` | `cardio` | `other`), `status` (`done`), `source` (`pulse`, or `demo` for the demo strap), `started_at`, `ended_at`, `duration_s`, `avg_hr`, `max_hr`, `min_hr`, `calories_kcal`, `zones`, `hrv`, `hr_trace`, `notes_raw` and a one-line `summary`. Pulse never invents a session `number`; the coach assigns it. Full detail (laps, gaps, parsed notes) is under `session` and `notes`. Raw RR intervals are not sent.
+- **Kind:** the notes screen has a picker (Upper A, Upper B, Lower, Cardio, Other), preselected from what you dictate (bench/press/row/pull → upper, squat/deadlift/lunge/leg → lower, run/bike/row erg/zone 2 → cardio). Upper A/B is only preselected when the notes say "upper A" / "day B" etc.; otherwise it stays on Other for you to pick. You can change the kind later on the session page; that bumps the revision and re-sends the workout to the coach (same `log_id`, so it updates the row).
+- **Demo workouts are never sent automatically.** You can still tap **Send to coach**; the log then says `source: "demo"` and tells the coach not to insert it.
 - The session page shows a small status chip: **Sent to coach**, **Sending…**, **Waiting to send** (offline) or **Coach: not sent** (with the error), plus a **Send to coach** / **Send again** button. The coach's reply appears in a **Coach's take** card and in the session's coach chat.
 - If the coach is unreachable, nothing is lost: the log is marked failed and retried the next time Pulse opens (and when the browser comes back online). Delivery status lives in IndexedDB (`coachlog` store).
-- Editing notes later doesn't re-send automatically; use **Send again** (the revision number goes up).
+- Editing notes later doesn't re-send automatically; use **Send again** (the revision number goes up). Changing the kind does re-send.
 
 ---
 
@@ -221,4 +229,4 @@ python3 tests/e2e.py                                     # CHROMIUM=/path/to/chr
 PULSE_FLOWS=coach_retry_flow python3 tests/e2e.py        # run selected flows only (comma-separated)
 ```
 
-The end-to-end test drives the demo strap and a scripted fake `navigator.bluetooth` through Start → Connecting → Live (lap, dropout/reconnect, pause) → End → Notes → Session (CSV/JSON) → Coach (auto-sent workout log with session key, then mocked SSE chat) → Dashboard → Settings, plus coach-offline retry and the status chip, crash recovery, delete, Supabase sync (mocked API) and the service worker, at 390 px and 1440 px. It fails on any console error.
+The end-to-end test drives the demo strap and a scripted fake `navigator.bluetooth` through Start → Connecting → Live (lap, dropout/reconnect, pause) → End → Notes (kind picker) → Session (CSV/JSON) → Coach (demo: not auto-sent, manual send marked demo; real strap: auto-sent workout log with session key, kind edit re-send, then mocked SSE chat) → Dashboard → Settings, plus coach-offline retry and the status chip, crash recovery, delete, Supabase sync (mocked API: days + workouts upsert on log_id, demo never synced) and the service worker, at 390 px and 1440 px. It fails on any console error.
