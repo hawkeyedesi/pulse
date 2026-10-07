@@ -56,7 +56,7 @@ export async function importData(json) {
   } else {
     throw new Error('Not a Pulse export file');
   }
-  sessions = sessions.filter((s) => s && s.id && s.startedAt).map((s) => ({ ...s, syncedAt: null, updatedAt: Date.now(), status: s.status === 'active' ? 'complete' : s.status }));
+  sessions = sessions.filter((s) => s && s.id && s.startedAt).map((s) => ({ ...s, syncedAt: null, cloudSyncedAt: null, updatedAt: Date.now(), status: s.status === 'active' ? 'complete' : s.status }));
   samples = samples.filter((s) => s && s.sessionId && Number.isFinite(s.seq));
   notes = notes.filter((n) => n && n.sessionId);
   await db.putMany('sessions', sessions);
