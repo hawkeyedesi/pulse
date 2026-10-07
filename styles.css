@@ -377,3 +377,8 @@ body.coach-open.desk main { margin-right: 440px; }
 .msg.user.log { background: var(--surface-2); color: var(--text-1); font-size: 13px; }
 .msg.user.log summary { cursor: pointer; font-weight: 500; }
 .msg.user.log details div { margin-top: 6px; }
+
+/* kind picker (notes screen) + session kind select */
+.kind-picker .type-chips { margin: 2px 0 4px; }
+#kind-hint:empty { display: none; }
+#demo-badge { margin-top: 6px; display: inline-flex; }
