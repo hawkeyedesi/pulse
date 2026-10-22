@@ -1,0 +1,28 @@
+name: Supabase keep-alive
+
+# Free-plan Supabase projects pause after a stretch with no activity.
+# This pings the Pulse database once a day so it stays awake.
+on:
+  schedule:
+    - cron: "17 15 * * *"   # daily, 15:17 UTC (~8 am Pacific)
+  workflow_dispatch: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Supabase REST (runs a real query)
+        env:
+          SUPABASE_URL: https://aoarlvvqojxliblvcszj.supabase.co
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          if [ -z "$SUPABASE_ANON_KEY" ]; then
+            echo "::error::Add the SUPABASE_ANON_KEY repo secret (Settings > Secrets and variables > Actions)."
+            exit 1
+          fi
+          code=$(curl -s -o /tmp/out.json -w "%{http_code}" \
+            "$SUPABASE_URL/rest/v1/workouts?select=id&limit=1" \
+            -H "apikey: $SUPABASE_ANON_KEY" \
+            -H "Authorization: Bearer $SUPABASE_ANON_KEY")
+          echo "HTTP $code"; cat /tmp/out.json; echo
+          [ "$code" = "200" ] || exit 1
