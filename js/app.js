@@ -185,7 +185,7 @@ async function renderStart() {
   const bt = bluetoothSupport();
   const warn = $('#bt-warning');
   if (!bt.available && !isDemo()) {
-    warn.innerHTML = 'This browser can’t use Bluetooth. Use <strong>Bluefy</strong> on iPhone or <strong>Chrome/Edge</strong> on desktop, or turn on the demo strap below.';
+    warn.innerHTML = 'This browser can’t use Bluetooth. On iPhone, use Safari with the free <a href="https://beacio.com" target="_blank" rel="noopener"><strong>beacio</strong></a> extension turned on (or the Bluefy app). On a computer, use <strong>Chrome/Edge</strong>. Or turn on the demo strap below.';
     warn.hidden = false;
   } else warn.hidden = true;
 }
@@ -214,7 +214,7 @@ function handleStart({ resumeSession = null } = {}) {
   keepAwake();
   const bt = bluetoothSupport();
   if (!demo && !bt.available) {
-    connectingProblem('Web Bluetooth isn’t available here. On iPhone open Pulse in Bluefy; on a computer use Chrome or Edge. Or try the demo strap.');
+    connectingProblem('Web Bluetooth isn’t available here. On iPhone, turn on the beacio extension in Safari (Page Menu → Manage Extensions) and allow it on this site, or use Bluefy. On a computer use Chrome or Edge. Or try the demo strap.');
     return;
   }
   if (!demo && bt.getDevices && rememberedStrap()?.id) {
@@ -810,7 +810,7 @@ async function renderSettings() {
             : `<div class="field-row"><label class="field grow"><span>Email</span><input type="email" id="auth-email" placeholder="you@example.com" value="${esc(localStorage.getItem('pulse.authEmail') || '')}"></label></div>
             <div class="btn-row"><button type="button" class="btn small primary" id="send-link">Email me a sign-in link</button></div>
             <div class="field-row"><label class="field"><span>Or enter the 6-digit code</span><input type="text" id="auth-code" inputmode="numeric" maxlength="10" placeholder="123456"></label><button type="button" class="btn small" id="verify-code">Verify</button></div>
-            <p class="muted small">On iPhone the email link opens Safari, not Bluefy, so use the code (see README to add it to the email).</p>`}
+            <p class="muted small">On iPhone, open Pulse in Safari (with beacio) and the email link signs you in right here. If you open the email in Gmail or another app, long-press the link and choose Open in Safari. Using Bluefy? Enter the 6-digit code instead.</p>`}
         </div>
         <p class="muted small" id="sync-detail"></p>
       </section>
