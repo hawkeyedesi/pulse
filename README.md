@@ -2,7 +2,7 @@
 
 Pulse is a personal workout tracker for a Polar chest strap (H10 or H9, or any strap that exposes the standard Bluetooth Heart Rate Service). It runs entirely in the browser:
 
-- **iPhone:** inside the free **Bluefy** browser (it has Web Bluetooth; Safari doesn't).
+- **iPhone:** in regular Safari with the free **beacio** extension (iOS 18+, adds Web Bluetooth), or in the free **Bluefy** browser.
 - **Desk:** Chrome or Edge on a computer, with a big-screen "desk" layout readable from about 6 ft.
 
 You tap **Start workout**, Pulse connects to the strap, and it shows your live BPM, zone, timer, a 5-minute chart, averages and calories, time in zones, battery, and Lap/Set, Pause and End buttons. Afterwards you dictate notes, which a local parser turns into chips ("Bench press 4×8 @155 lb", "Effort 7/10", "Sleep ~6 h", "Shoulder tightness"). Every session gets a detail page with a full chart and CSV/JSON export, and there's a trends dashboard plus a chat panel with your **OpenClaw** coach.
@@ -58,13 +58,22 @@ Turn on **Demo strap** on the Start screen, open `?demo=1`, or go to **Settings 
 
 ## 2. Using it
 
-### iPhone (Bluefy)
-1. Install **Bluefy – Web BLE Browser** from the App Store and open your Pages URL in it.
-2. Optional: add it to your home screen from Bluefy's share menu (`manifest.webmanifest` and the icons are included).
-3. Wet the strap electrodes, put the strap on, and tap **Start workout**. The first time, Bluefy shows a device picker: choose "Polar H10 …". After that, Pulse reconnects to the remembered strap through `navigator.bluetooth.getDevices()` without the picker. If that fails, it shows a **Choose strap** button (the picker has to come from a tap).
-4. The screen stays awake during a workout. Pulse uses `navigator.wakeLock` and re-acquires it when you come back to the app, plus Bluefy's own `bluetooth.setScreenDimEnabled(false)`.
-5. Notes: tap the text box, then tap the 🎤 on the iOS keyboard to dictate. (Pulse also tries the Web Speech API where a browser has it.)
-6. Make sure the strap isn't connected to the Polar app (or another app) at the same time. Most straps allow only one or two connections.
+### iPhone (Safari + beacio, recommended)
+1. Needs iOS 18 or later. Install **beacio** (free) from the App Store: https://apps.apple.com/app/id6761301368
+2. In Safari, open any site, tap the **Page Menu** button at the left of the address bar → **Manage Extensions** → switch **beacio** on → **Done**. Tap **beacio** and choose **Allow on Every Website** (or allow it on the Pulse site).
+3. Open `https://pulse-hr.pages.dev/` in Safari (not a Private tab; extensions are off there). Optional: Share → **Add to Home Screen**.
+4. Wet the strap electrodes, put the strap on, and tap **Start workout**. Safari asks once to allow Bluetooth; tap **Allow**, then choose "Polar H10 …". After that, Pulse reconnects to the remembered strap through `navigator.bluetooth.getDevices()` without the picker. If that fails, it shows a **Choose strap** button (the picker has to come from a tap).
+5. The screen stays awake during a workout through `navigator.wakeLock` (Safari 16.4+), re-acquired when you come back to the app.
+6. Sign-in: the Supabase email link opens in Safari, so it signs Pulse in directly. From the Gmail app, long-press the link → Open in Safari.
+7. Notes: tap the text box, then tap the 🎤 on the iOS keyboard to dictate.
+8. Make sure the strap isn't connected to the Polar app (or another app) at the same time. Most straps allow only one or two connections.
+
+> If the Home Screen icon version of Pulse doesn't see Bluetooth, use it from a Safari tab instead: Safari extensions don't always run in Home Screen web apps.
+
+### iPhone (Bluefy, alternative)
+1. Install **Bluefy – Web BLE Browser** from the App Store and open the Pulse URL in it.
+2. Bluefy shows its own device picker on first start, and Pulse also calls Bluefy's `bluetooth.setScreenDimEnabled(false)` to keep the screen on.
+3. In Bluefy, sign in with the 6-digit email code (the email link would open Safari instead).
 
 ### Desktop (Chrome / Edge)
 - Open the URL and tap **Start workout**. Chrome shows its Bluetooth picker.
@@ -84,8 +93,8 @@ Turn on **Demo strap** on the Start screen, open `?demo=1`, or go to **Settings 
 2. Go to **SQL Editor → New query**, paste `supabase/schema.sql`, and click **Run**. This creates `days`, `workouts`, `meals` and `weigh_ins`, the same tables the coach keeps in OpenClaw's `health.sqlite3` (plus a uuid `id`, a `user_id` and RLS policies so only the signed-in owner, `auth.uid()`, can read or write rows). `workouts` has the coach columns (`date` → `days`, `number`, `kind`, `status`, `summary`, `polar_json`) and the extras (`log_id` UNIQUE, `revision`, `source`, `started_at`/`ended_at`, `duration_s`, `avg_hr`/`max_hr`/`min_hr`, `calories_kcal`, `zones_json`, `hrv_json`, `hr_trace_json`, `notes_raw`), plus `updated_at`/`deleted_at` for sync. Re-running the script is safe.
 3. Go to **Authentication → Sign In / Providers** and make sure **Email** is enabled (it is by default).
 4. Go to **Authentication → URL Configuration**. Set **Site URL** to `https://<your-user>.github.io/pulse/` and add the same URL, plus `http://localhost:8000/` if you test locally, to **Redirect URLs**.
-5. **Recommended for iPhone:** go to **Authentication → Emails → Magic Link** and add the one-time code to the template, for example `<p>Or enter this code in Pulse: <strong>{{ .Token }}</strong></p>`. On iPhone, a magic link opens in Safari, not Bluefy, so the session would end up in the wrong browser. Typing the 6-digit code into Pulse in Bluefy signs in Bluefy.
-6. In **Project Settings → API**, copy the **Project URL** and the **anon / publishable key**. Paste them into Pulse under **Settings → Sync**, enter your email, then tap **Email me a sign-in link** and use the link (desktop) or the code (iPhone).
+5. **Recommended for iPhone:** go to **Authentication → Emails → Magic Link** and add the one-time code to the template, for example `<p>Or enter this code in Pulse: <strong>{{ .Token }}</strong></p>`. With Safari + beacio the link just works on iPhone; the code is only needed if you use Bluefy (a link would open Safari, not Bluefy).
+6. In **Project Settings → API**, copy the **Project URL** and the **anon / publishable key**. Paste them into Pulse under **Settings → Sync**, enter your email, then tap **Email me a sign-in link** and use the link (desktop, or iPhone Safari) or the code (Bluefy).
 
 How sync behaves:
 - IndexedDB on the device stays the source of truth (local-first). Finished workouts are pushed whenever you're online and signed in: when you save, when the browser comes back online, and every 5 minutes. Unsynced workouts wait in the local queue.
