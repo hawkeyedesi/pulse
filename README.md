@@ -107,6 +107,27 @@ How sync behaves:
 - Upgrading from the v1 schema (`sessions`/`samples`/`notes`): run the new script, and each device re-pushes its local workouts into `workouts` on its next sync. The old tables are then unused; the bottom of `schema.sql` shows how to drop them.
 - The anon key is meant to be public. RLS is what protects the data.
 
+### Coach-reported history on every device
+
+The **History** tab reads the same `workouts` table as Pulse sync, including
+manual reports, skips and recovery days. Sign in to the same Supabase account on
+each device, then open History or press Refresh. A per-account saved copy is
+available when a live refresh fails. Signed-out users cannot browse that copy.
+
+For imported coach records, run `supabase/workout-history.sql` once. The optional
+`workouts.history_json` column preserves the complete original report, exercise
+sets, source status, metrics and provenance. Pulse pushes do not overwrite it.
+Use stable import IDs/log IDs, create parent days first, and reconcile actual
+Pulse log IDs before importing. Date-only reports have no fabricated recording
+time; unknown duration stays null. A partially completed plan with real activity
+can be `done`, while a recovery check-in without activity remains `skip`; retain
+the original flag in `history_json` and preserve the explanatory summary.
+
+History never turns reports into synthetic strap recordings. Dashboard charts
+continue to use the recorded sessions; History shows the complete report ledger.
+The source JSON and import SQL contain private training data: keep them outside
+this public repository and outside the deployed site directory.
+
 ---
 
 ## 4. OpenClaw coach

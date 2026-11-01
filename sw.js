@@ -1,12 +1,12 @@
 // Pulse service worker: makes the app shell available offline.
 // Same-origin GETs: stale-while-revalidate (instant load, refreshed in the background).
 // Bump VERSION when you want every client to drop the old cache.
-const VERSION = 'pulse-v4';
+const VERSION = 'pulse-v6-history';
 const SHELL = [
   './', './index.html', './styles.css', './manifest.webmanifest',
   './js/app.js', './js/ble.js', './js/hr-parse.js', './js/notes-parser.js', './js/stats.js', './js/db.js',
   './js/charts.js', './js/recorder.js', './js/settings.js', './js/wakelock.js', './js/export.js',
-  './js/sync.js', './js/coach.js', './js/coach-sync.js', './js/workout-log.js', './js/demo.js',
+  './js/sync.js', './js/training-history.js', './js/coach.js', './js/coach-sync.js', './js/workout-log.js', './js/demo.js',
   './icons/icon.svg', './icons/icon-192.png', './icons/icon-512.png', './icons/apple-touch-icon.png',
 ];
 

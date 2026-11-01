@@ -12,6 +12,7 @@ import { drawHrChart, drawBars, drawLine, drawScatter, zoneColors, cssVar } from
 import { keepAwake, allowSleep, wakeState, onWakeChange } from './wakelock.js';
 import { samplesToCsv, sessionBundle, download, fileStem, exportAll, importData } from './export.js';
 import * as sync from './sync.js';
+import { historyItem, loadHistory } from './training-history.js';
 import {
   coachConfigured, sessionContext, trendContext, buildMessages, sendChat, sendToSession,
   autoSendEnabled, coachSessionKey, sessionKeyIssue,
@@ -126,6 +127,7 @@ async function route() {
     case 'notes': return renderNotes(id);
     case 'session': return renderSession(id);
     case 'dashboard': return renderDashboard();
+    case 'history': return renderTrainingHistory();
     case 'settings': return renderSettings();
     default: return go('#/');
   }
@@ -757,6 +759,45 @@ async function renderDashboard() {
     tr.onkeydown = (e) => { if (e.key === 'Enter') go(tr.dataset.href); };
   });
   $('#dash-coach').onclick = () => openCoach({ sessionId: null });
+}
+
+// ------------------------------------------------------------------ coach history
+async function renderTrainingHistory() {
+  const seq = state.routeSeq;
+  showScreen('history');
+  const el = $('#screen-history');
+  const header = '<div class="page-head"><div><div class="eyebrow">Coach ledger</div><h1>Training history</h1></div><button class="btn small" id="history-refresh">Refresh</button></div>';
+  const setContent = (body) => {
+    el.innerHTML = header + body;
+    $('#history-refresh').onclick = () => renderTrainingHistory();
+  };
+  setContent('<p class="muted" role="status">Loading your history…</p>');
+  try {
+    const user = sync.syncConfigured() ? await sync.currentUser() : null;
+    if (isStale(seq)) return;
+    if (!user) {
+      setContent('<div class="card"><p>Sign in to your Supabase account in <a href="#/settings">Settings</a> to see your coach history on this device.</p></div>');
+      return;
+    }
+    const { rows, cached } = await loadHistory(await sync.getClient(), user.id);
+    if (isStale(seq)) return;
+    setContent(`<p class="muted" role="status">${rows.length} workout records · ${cached ? 'Saved copy; live refresh unavailable' : 'Read from your cloud account'}. Includes activity, partial sessions, skips and recovery days. Only strap recordings contribute to recorded-session charts; unknown measurements stay unknown.</p>` +
+      (rows.map((row) => {
+        const h = historyItem(row);
+        const raw = h.record.raw || {};
+        return `<article class="card history-record" data-history-id="${esc(h.id)}">
+          <div class="eyebrow">${esc(h.date)} · ${esc(h.status)}</div>
+          <h2>${esc(h.title)}</h2><p>${esc(h.summary)}</p>
+          <p class="muted small">${esc(h.duration || 'Duration not reported')} · ${h.nativeLogId ? 'Linked Pulse recording' : 'Coach report (not a strap recording)'}</p>
+          ${h.notes ? `<p class="muted">${esc(h.notes)}</p>` : ''}
+          ${raw.planned_summary ? `<details><summary>Original plan (not completed activity)</summary><p>${esc(raw.planned_summary)}</p></details>` : ''}
+          ${h.nativeLogId ? `<p><a href="#/session/${encodeURIComponent(h.nativeLogId)}">Open recorded workout</a> · Use Sync now in Settings if it is not on this device yet.</p>` : ''}
+          <details><summary>Full report, exercises, metrics and provenance</summary><pre style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(JSON.stringify(h.record, null, 2))}</pre></details>
+        </article>`;
+      }).join('') || '<div class="card"><p>No coach history has been imported into this account yet.</p></div>'));
+  } catch (e) {
+    if (!isStale(seq)) setContent(`<div class="card"><p role="alert">Could not load history: ${esc(e.message || e)}</p><p>Check your connection, then Refresh.</p></div>`);
+  }
 }
 
 // ------------------------------------------------------------------ settings
