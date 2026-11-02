@@ -89,7 +89,14 @@ p { margin: 0 0 10px; }
 .nav a.active { background: var(--surface-2); color: var(--text-1); }
 .topbar-right { margin-left: auto; display: flex; align-items: center; gap: 8px; }
 body.phone .topbar { gap: 8px; padding-left: 12px; padding-right: 12px; }
-body.phone .nav a { padding: 6px 9px; }
+body.phone .nav a { padding: 6px 8px; font-size: 13.5px; }
+body.phone .nav { gap: 2px; min-width: 0; }
+/* four tabs + a sync chip must fit 360-390 px: the brand shrinks to its heart icon */
+@media (max-width: 480px) {
+  body.phone .brand { font-size: 0; gap: 0; }
+  body.phone .topbar-right { min-width: 0; }
+  body.phone #sync-chip { padding: 4px 8px; font-size: 12px; white-space: nowrap; }
+}
 body.phone #layout-toggle { display: none; }
 body[data-screen="live"] .topbar, body[data-screen="connecting"] .topbar { display: none; }
 
@@ -382,3 +389,53 @@ body.coach-open.desk main { margin-right: 440px; }
 .kind-picker .type-chips { margin: 2px 0 4px; }
 #kind-hint:empty { display: none; }
 #demo-badge { margin-top: 6px; display: inline-flex; }
+
+/* ---------- 9. Fuel (food logging) ---------- */
+.fuel-grid { display: grid; gap: 14px; grid-template-columns: 1fr; }
+.fuel-grid > div { min-width: 0; display: flex; flex-direction: column; gap: 14px; }
+.fuel-grid .card + .card, .fuel-grid .tiles { margin: 0; }
+body.desk .fuel-grid { grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); align-items: start; }
+.fuel-log-btn { min-height: 96px; font-size: 24px; cursor: pointer; }
+.fuel-log-btn svg { color: var(--z3); }
+body.desk .fuel-log-btn { min-height: 130px; font-size: 28px; }
+.fuel-alt { display: flex; justify-content: center; gap: 6px; margin-top: -6px; }
+.fuel-alt label { cursor: pointer; }
+.fuel-mode { margin-bottom: 12px; display: inline-flex; }
+.fuel-tiles { grid-template-columns: 1fr 1fr; }
+.fuel-main > .fuel-tiles:first-child { margin-top: 0; }
+.fuel-bar { height: 8px; border-radius: 999px; background: var(--surface-2); overflow: hidden; margin-top: 8px; }
+.fuel-bar span { display: block; height: 100%; border-radius: 999px; transition: width 0.5s ease; }
+.fuel-dots { display: flex; gap: 5px; margin-top: 8px; }
+.fuel-dots i { width: 12px; height: 12px; border-radius: 50%; background: var(--surface-2); border: 1px solid var(--line-strong); }
+.fuel-dots i.on { background: var(--z2); border-color: transparent; }
+.fuel-composer-top { display: flex; gap: 14px; align-items: flex-start; }
+.fuel-preview { width: 112px; height: 112px; object-fit: cover; border-radius: var(--radius-sm); flex: none; background: var(--surface-2); }
+.fuel-preview.empty { display: grid; place-items: center; color: var(--text-3); font-size: 13px; }
+.fuel-composer-fields { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 8px; }
+.fuel-composer-fields textarea, #fuel-note { width: 100%; font: inherit; padding: 10px 12px; border-radius: var(--radius-sm); border: 1px solid var(--line-strong); background: var(--surface); color: var(--text-1); resize: vertical; }
+.fuel-composer-fields .hint { margin: 0; }
+.fuel-composer .chip-btn { min-height: 34px; padding: 8px 12px; font-size: 13px; }
+.fuel-quick .chip-btn { font-size: 13px; }
+.fuel-meals { list-style: none; margin: 8px 0 0; padding: 0; }
+.fuel-meal { display: flex; gap: 12px; align-items: flex-start; padding: 10px 0; border-top: 1px solid var(--line); }
+.fuel-meal:first-child { border-top: 0; }
+.fuel-thumb { width: 52px; height: 52px; border-radius: 10px; object-fit: cover; flex: none; background: var(--surface-2); }
+.fuel-thumb.small { width: 40px; height: 40px; }
+.fuel-thumb.empty { display: grid; place-items: center; color: var(--text-3); }
+.fuel-meal-body { flex: 1; min-width: 0; }
+.fuel-meal-title { font-weight: 500; }
+.fuel-items { overflow-wrap: anywhere; }
+.fuel-num { font-variant-numeric: tabular-nums; font-weight: 500; }
+.fuel-meal-side { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; flex: none; }
+.fuel-meal-side .btn.small { min-height: 28px; padding: 4px 10px; }
+.fuel-meal.skipped { opacity: 0.75; }
+.fuel-questions { border-color: color-mix(in srgb, var(--z3) 45%, transparent); }
+.fuel-q { margin-top: 12px; }
+.fuel-q-prompt { font-weight: 500; margin-bottom: 6px; }
+.chip-btn.suggested:not(.on) { border-color: var(--text-2); }
+.fuel-wt-chart { height: 150px; }
+.fuel-skips:empty { display: none; }
+.channel { border-top: 1px solid var(--line); padding-top: 10px; margin-top: 6px; }
+.channel-routes { display: flex; flex-wrap: wrap; gap: 6px 16px; align-items: center; }
+.h3 { font-size: 15px; font-weight: 600; margin: 16px 0 2px; }
+@media (max-width: 380px) { .fuel-preview { width: 84px; height: 84px; } }
