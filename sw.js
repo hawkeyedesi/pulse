@@ -1,12 +1,13 @@
 // Pulse service worker: makes the app shell available offline.
 // Same-origin GETs: stale-while-revalidate (instant load, refreshed in the background).
 // Bump VERSION when you want every client to drop the old cache.
-const VERSION = 'pulse-v4';
+const VERSION = 'pulse-v5';
 const SHELL = [
   './', './index.html', './styles.css', './manifest.webmanifest',
   './js/app.js', './js/ble.js', './js/hr-parse.js', './js/notes-parser.js', './js/stats.js', './js/db.js',
   './js/charts.js', './js/recorder.js', './js/settings.js', './js/wakelock.js', './js/export.js',
   './js/sync.js', './js/coach.js', './js/coach-sync.js', './js/workout-log.js', './js/demo.js',
+  './js/channels.js', './js/fuel.js', './js/fuel-ui.js', './js/fuel-log.js', './js/fuel-questions.js', './js/fuel-nutrition.js', './js/fuel-decide.js',
   './icons/icon.svg', './icons/icon-192.png', './icons/icon-512.png', './icons/apple-touch-icon.png',
 ];
 
@@ -28,6 +29,7 @@ self.addEventListener('fetch', (event) => {
   const sameOrigin = url.origin === self.location.origin;
   const cdn = /(^|\.)jsdelivr\.net$|fonts\.(googleapis|gstatic)\.com$/.test(url.hostname);
   if (!sameOrigin && !cdn) return; // never touch Supabase / coach API traffic
+  if (sameOrigin && url.pathname.includes('/api/')) return; // server endpoints (decide) are never cached
   event.respondWith((async () => {
     const cache = await caches.open(VERSION);
     const cached = await cache.match(req, { ignoreSearch: sameOrigin && url.pathname.endsWith('/') });
