@@ -141,13 +141,21 @@ export async function sendChat(settings, messages, onDelta = () => {}, signal) {
  * One non-streaming user message into the configured session (used for workout logs).
  * Tolerates a gateway that streams anyway. Rejects on network/HTTP/agent errors or timeout.
  */
-export async function sendToSession(settings, content, { signal, timeoutMs = 180000 } = {}) {
+export async function sendToSession(settings, content, opts = {}) {
+  return sendMessageToSession(settings, { role: 'user', content }, opts);
+}
+
+/**
+ * Same as sendToSession, with a whole user message (content may be an array of OpenAI-style
+ * parts, e.g. text + image_url data URL; used by Fuel to ask the food coach to name items).
+ */
+export async function sendMessageToSession(settings, message, { signal, timeoutMs = 180000 } = {}) {
   const ac = new AbortController();
   const onAbort = () => ac.abort();
   signal?.addEventListener('abort', onAbort);
   const timer = setTimeout(() => ac.abort(new Error('timeout')), timeoutMs);
   try {
-    const res = await postCompletion(settings, { stream: false, messages: [{ role: 'user', content }] }, ac.signal);
+    const res = await postCompletion(settings, { stream: false, messages: [message] }, ac.signal);
     const ctype = res.headers.get('content-type') || '';
     if (ctype.includes('text/event-stream') && res.body) return await readSse(res.body);
     const j = await res.json();
