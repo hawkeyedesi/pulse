@@ -7,9 +7,12 @@
 //   chats     keyPath key           (coach conversations)
 //   outbox    autoIncrement         (pending remote deletes)
 //   coachlog  keyPath sessionId     (v2: workout-log delivery to the coach session)
+//   meals      keyPath log_id       (v3: Fuel meal logs incl. small thumbnail + estimate + coach status)
+//   mealphotos keyPath log_id       (v3: downscaled ~1024 px photo, kept only until estimation is done)
+//   weighins   keyPath log_id       (v3: weigh-ins, lbs)
 
 const DB_NAME = 'pulse';
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 let dbPromise = null;
 
 export function openDb() {
@@ -28,6 +31,9 @@ export function openDb() {
       if (!db.objectStoreNames.contains('chats')) db.createObjectStore('chats', { keyPath: 'key' });
       if (!db.objectStoreNames.contains('outbox')) db.createObjectStore('outbox', { keyPath: 'id', autoIncrement: true });
       if (!db.objectStoreNames.contains('coachlog')) db.createObjectStore('coachlog', { keyPath: 'sessionId' });
+      if (!db.objectStoreNames.contains('meals')) db.createObjectStore('meals', { keyPath: 'log_id' });
+      if (!db.objectStoreNames.contains('mealphotos')) db.createObjectStore('mealphotos', { keyPath: 'log_id' });
+      if (!db.objectStoreNames.contains('weighins')) db.createObjectStore('weighins', { keyPath: 'log_id' });
     };
     req.onsuccess = () => {
       const db = req.result;
@@ -107,7 +113,7 @@ export async function notesMap() {
 
 export async function clearAll() {
   const db = await openDb();
-  const names = ['sessions', 'samples', 'notes', 'chats', 'outbox', 'coachlog'];
+  const names = ['sessions', 'samples', 'notes', 'chats', 'outbox', 'coachlog', 'meals', 'mealphotos', 'weighins'];
   const tx = db.transaction(names, 'readwrite');
   names.forEach((n) => tx.objectStore(n).clear());
   return txDone(tx);
