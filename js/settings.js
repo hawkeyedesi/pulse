@@ -1,5 +1,6 @@
 // Settings live only in this device's localStorage (including the coach token).
 import { DEFAULT_SETTINGS } from './stats.js';
+import { migrateChannels } from './channels.js';
 
 const KEY = 'pulse.settings';
 let cache = null;
@@ -11,6 +12,12 @@ export function getSettings() {
     try { saved = JSON.parse(localStorage.getItem(KEY) || '{}'); } catch { saved = {}; }
     cache = { ...DEFAULT_SETTINGS, ...saved };
     if (!Array.isArray(cache.zones) || cache.zones.length !== 4) cache.zones = [...DEFAULT_SETTINGS.zones];
+    // v5: single coach session key -> list of channels (workouts keeps the existing key)
+    const mig = migrateChannels(cache);
+    if (mig) {
+      cache = { ...cache, ...mig };
+      try { localStorage.setItem(KEY, JSON.stringify(cache)); } catch { /* private mode */ }
+    }
   }
   return cache;
 }
@@ -26,6 +33,7 @@ export function onSettings(fn) { listeners.add(fn); return () => listeners.delet
 
 /** Settings safe to include in an export file (no secrets). */
 export function exportableSettings() {
-  const { gatewayToken, supabaseAnonKey, coachSessionKey, ...rest } = getSettings();
-  return rest;
+  const { gatewayToken, supabaseAnonKey, coachSessionKey, decideToken, coachChannels, ...rest } = getSettings();
+  // channel names/routes are fine to export; their session keys are not
+  return { ...rest, coachChannels: (coachChannels || []).map(({ sessionKey, ...c }) => c) };
 }
