@@ -7,6 +7,8 @@ Pulse is a personal workout tracker for a Polar chest strap (H10 or H9, or any s
 
 You tap **Start workout**, Pulse connects to the strap, and it shows your live BPM, zone, timer, a 5-minute chart, averages and calories, time in zones, battery, and Lap/Set, Pause and End buttons. Afterwards you dictate notes, which a local parser turns into chips ("Bench press 4×8 @155 lb", "Effort 7/10", "Sleep ~6 h", "Shoulder tightness"). Every session gets a detail page with a full chart and CSV/JSON export, and there's a trends dashboard plus a chat panel with your **OpenClaw** coach.
 
+**Fuel** is the food side: snap a photo of a meal (optionally say "cooked in ghee" or "ate half"), and Pulse estimates calories and protein, asks at most three one-tap questions when it isn't sure, tracks today against your targets, your logging streak and a 7-day weight trend, and drops each meal into your coach's food thread (section 5).
+
 It's a static site with no build step (plain HTML, CSS and ES modules), so GitHub Pages can host it as-is.
 
 - **Local-first:** everything is saved in IndexedDB on the device. Samples are written as they arrive, so a crash or reload loses nothing, and Pulse offers to resume or save an unfinished workout.
@@ -28,7 +30,16 @@ js/
   coach.js         OpenClaw chat (OpenAI-compatible, streaming, optional session routing)
   workout-log.js   builds the "PULSE WORKOUT LOG v1" message sent to the coach session
   coach-sync.js    sends each saved workout to the coach; per-session status + retries
+  channels.js      coach channels (session key + routes: workouts / food / weigh-ins), legacy-key migration
+  fuel.js          Fuel pipeline: log -> estimate -> questions -> coach food channel; streak/adherence/trend
+  fuel-ui.js       Fuel tab (phone + desk)
+  fuel-nutrition.js built-in nutrition table (Indian + American home food) + calorie/macro math
+  fuel-questions.js fixed Decisions-API question bank, confidence gating, mock decider
+  fuel-log.js      "PULSE MEAL LOG v1" payload + Supabase meal/weigh-in rows
+  fuel-decide.js   client for the server-side /api/decide endpoint; in-browser photo downscaling
   export.js settings.js wakelock.js demo.js
+_worker.js         server-side /api/decide (Cloudflare Pages function, advanced mode; also used by tools/*)
+_routes.json       limits that worker to /api/*
 icons/             app icons (SVG + PNG)
 supabase/schema.sql
 tools/coach-proxy.mjs   tiny CORS proxy for the OpenClaw gateway (runs on your Mac)
@@ -37,6 +48,7 @@ docs/coach-bridge.md    private bridge setup and operating notes
 tests/unit.test.mjs     parser/stats/SSE unit tests (node --test)
 tests/coach-local.test.mjs  bridge auth, routing, streaming and delivery retry tests
 tests/e2e.py            headless Chromium end-to-end test (Playwright)
+tests/fixtures/meal.jpg synthetic plate photo for the Fuel e2e flow
 ```
 
 ---
@@ -103,7 +115,7 @@ How sync behaves:
 - **Raw RR intervals are never uploaded.** `hrv_json` is the whole-session summary (RMSSD, SDNN, pNN50) and `hr_trace_json` is the heart rate averaged into 5-second buckets.
 - Deleting a workout soft-deletes its row (`deleted_at`), so your other devices remove it on their next sync.
 - Pulse workouts from your other devices are pulled down and rebuilt from `polar_json` and the 5-second trace (so their charts are 5-second resolution, without RR).
-- `meals` and `weigh_ins` are there for the coach; Pulse doesn't write them.
+- **Fuel (schema v3):** finished or skipped meals upsert into `meals` on `log_id`, weigh-ins into `weigh_ins` on `log_id` (days row first). Photos and thumbnails are never uploaded. Demo meals never sync. Deleting a meal soft-deletes its row. (Meals are pushed, not yet pulled down to other devices.) Upgrading from v2: re-run `supabase/schema.sql`; the v3 block only adds nullable columns and unique indexes.
 - Upgrading from the v1 schema (`sessions`/`samples`/`notes`): run the new script, and each device re-pushes its local workouts into `workouts` on its next sync. The old tables are then unused; the bottom of `schema.sql` shows how to drop them.
 - The anon key is meant to be public. RLS is what protects the data.
 
@@ -220,15 +232,60 @@ What happens when you save a workout (Save notes or Skip):
 
 ---
 
-## 5. Data and formats
+## 5. Fuel (food logging)
+
+Open the **Fuel** tab. Tap **Log food** to take a photo (the camera opens directly; **Choose photo** picks one from the library, **Note only** skips the photo). Add an optional typed or dictated note ("cooked in ghee", "ate half", "2 rotis"), check the meal type (guessed from the clock: breakfast 5–10:30, lunch 11:30–15:00, dinner 17:30–22:00, otherwise snack) and tap **Save**. The meal is in IndexedDB immediately and works offline; estimation runs in the background and waits for a connection if needed (**Waiting to estimate**).
+
+- **Shortcuts:** "Same as yesterday's lunch" / "Repeat: …" chips copy a recent meal; **★** saves a meal as a favourite chip; **Skipped breakfast** (etc.) marks a main meal skipped so it still counts for adherence.
+- **Today:** calories and protein against your targets (Settings → Fuel; your coach can propose new ones with a `TARGETS:` line, which Pulse offers as **Use them**), meals logged, **streak** (consecutive days with breakfast, lunch and dinner each logged or skipped), **this week** (complete days out of 7), and a **weigh-in** box (lb) with a 7-day trend.
+- **Photos:** shrunk in the browser to a ≤1024 px JPEG; only a ~160 px thumbnail stays after the estimate is done. Photos never go to Supabase.
+
+### How the estimate works
+1. **Decision layer (Perplexity Decisions API).** Decision models only pick from answers we define, so Pulse sends a fixed question bank built from its nutrition table, in two calls: *identify* (is each known food in the meal? something not on the list? one of your favourites?) then *detail* (portion per likely food, e.g. ½ / 1 / 1½ / 2+ cups or 1 / 2 / 3 / 4+ pieces; cooking fat none / a little / a lot; amount eaten all / most / half / a little). The photo (data URL) and your note go in `state`.
+2. **Confidence gating.** Answers with confidence ≥ the threshold (Settings → Fuel, default 0.6) are accepted silently. Uncertain ones are ranked by how many calories they swing and shown as tap buttons with the same options, at most 3 per meal (configurable); the rest use the model's probability-weighted guess. All uncertain *foods* share one multi-select question ("Which of these are on your plate?", likely ones pre-selected), because live tests showed the models over-detect on busy plates; foods your note names count as present.
+3. **Coach for the open-ended part.** If something on the plate isn't in the table (or nothing matched), Pulse sends the photo + note to the coach's **food channel** (`PULSE FOOD ID v1`) and uses the items and values it returns.
+4. **Math in code.** Calories/macros = table value × portion, + cooking-fat adjustment for cooked dishes (a lot = +1 tbsp ≈ 120 kcal), × amount eaten, plus the coach's values for unknown items. Each meal stores `estimate_source` (`decider`, `decider+coach`, `coach`, `favorite`, `repeat`) and a `confidence` (0–1; your taps count as certain).
+
+### The server endpoint (the API key never reaches the browser)
+Settings → Fuel → **Photo estimates**:
+- **Pulse server (default):** `POST ./api/decide` on the same site, served by `_worker.js` as a Cloudflare Pages function. It needs two Pages secrets: `PERPLEXITY_API_KEY` and `PULSE_API_TOKEN` (a random string you also paste into **Endpoint token**). See `deploy_cf.md` at the repo root of the project. It validates every request (model whitelist, ≤128 well-formed questions, note ≤1000 chars, JPEG/PNG/WebP data-URL images only, ≤6 MB) and returns only `{model, answers, usage, request_id}`.
+- **My Mac:** the same handler on `tools/coach-local.mjs` (Pulse token) or `tools/coach-proxy.mjs` (your gateway token, checked against the gateway), with `PERPLEXITY_API_KEY` in the Mac's environment. See [docs/coach-bridge.md](docs/coach-bridge.md).
+- **Mock:** deterministic, on-device (tests and demo). **Off:** the food coach estimates everything from the photo.
+- Model: `pplx-decider-v1.2` (default; more accurate on busy plates in testing, ~3.5k vs ~18k input tokens) or `pplx-decider-flash-v1.2`. Cost is tiny either way (≈2–18k input tokens per meal, $0.01–0.02 per million). Note that Flash answers each question separately and bills the photo once per question, while v1.2 answers them together.
+
+### Coach channels and the meal log
+Settings → Coach → **Coach channels** lists your OpenClaw sessions, each with routes: **Workouts**, **Food logs**, **Weigh-ins**. An existing single "Coach session key" becomes the **Workouts** channel automatically, and an empty **Food** channel (Food logs + Weigh-ins) is added: paste your food thread's session key there. Food logs and weigh-ins are never sent to the workout thread; until the food key is set they stay on the device (**No food channel**).
+
+Each finished (or skipped) meal goes to the food channel as one non-streaming message:
+
+~~~
+PULSE MEAL LOG v1
+log_id: <uuid> · revision: <n> · record: meal
+Coach: upsert days for <date> first, then upsert meals by log_id … then reply with a 1–2 sentence takeaway.
+Summary
+- Lunch · 2026-11-01 12:41 (America/Los_Angeles)
+- Items: Rice (cooked) 1 cup, Roti / chapati 2 pieces, Dal (lentils) 1 cup
+- Estimate: ~625 kcal · protein 23.3 g · carbs 111 g · fat 10.4 g (decider, confidence 0.94)
+Data
+```json
+{"format":"pulse-meal-log","version":1,"record":"meal","log_id":"…","revision":1,"date":"2026-11-01","time":"12:41",
+ "items":"Rice (cooked) 1 cup, …","source":"pulse","meal":"lunch","status":"logged","notes_raw":"…","kcal":625,
+ "protein_g":23.3,"carbs_g":111,"fat_g":10.4,"estimate_source":"decider","confidence":0.94,"answers_json":{…}}
+```
+~~~
+
+Mapping into the coach's `health.sqlite3`: the existing `meals` columns `date`, `time`, `items` (readable text), `source` (`pulse`; `demo` = never insert) are filled as before, so the coach's existing rows and writer keep working; the additive columns are `log_id` (upsert key), `revision`, `meal`, `status` (`logged` | `skipped`), `notes_raw`, `kcal`, `protein_g`, `carbs_g`, `fat_g`, `estimate_source`, `confidence`, `answers_json`. Weigh-ins use the same header with `record: weigh_in` and `date`, `time`, `lbs`, `note` → `weigh_ins` (upsert by `log_id`). Photos are never in the log.
+
+## 6. Data and formats
 
 - **CSV** (per session): `timestamp,elapsed_s,hr,rr_ms,lap`. `timestamp` is ISO 8601 UTC. `rr_ms` holds the RR intervals in milliseconds, separated by `;` when a packet carries several.
 - **JSON** (per session): `{format:"pulse-session", session, notes, samples}`.
 - **Settings → Export all** creates a full JSON backup with every session, sample and note, but no tokens. **Import** merges a backup or a single-session export.
 - **Zones** default to max HR 190 with Z1 <60%, Z2 60–70%, Z3 70–80%, Z4 80–90% and Z5 >90%. All of it is editable.
 - **Calories** are an estimate from heart rate, weight, age and sex (Keytel et al., 2005).
+- **Fuel** stores meals (`meals`, with a small thumbnail), the photo awaiting estimation (`mealphotos`, deleted afterwards) and weigh-ins (`weighins`) in IndexedDB. **Export all** includes meals and weigh-ins (thumbnails only).
 
-## 6. Tests
+## 7. Tests
 
 ```bash
 node --test tests/*.test.mjs                             # Node 22+: parsers, stats, SSE, coach log, proxy + bridge
@@ -236,6 +293,7 @@ pip install playwright && python -m playwright install chromium
 python3 -m http.server 8765 &                            # from this folder
 python3 tests/e2e.py                                     # CHROMIUM=/path/to/chromium to use a system browser
 PULSE_FLOWS=coach_retry_flow python3 tests/e2e.py        # run selected flows only (comma-separated)
+PULSE_FLOWS=sync_flow,fuel_flow,sw_check python3 tests/e2e.py   # Fuel + sync (the full run takes ~3 min)
 ```
 
 The end-to-end test drives the demo strap and a scripted fake `navigator.bluetooth` through Start → Connecting → Live (lap, dropout/reconnect, pause) → End → Notes (kind picker) → Session (CSV/JSON) → Coach (demo: not auto-sent, manual send marked demo; real strap: auto-sent workout log with session key, kind edit re-send, then mocked SSE chat) → Dashboard → Settings, plus coach-offline retry and the status chip, crash recovery, delete, Supabase sync (mocked API: days + workouts upsert on log_id, demo never synced) and the service worker, at 390 px and 1440 px. It fails on any console error.
