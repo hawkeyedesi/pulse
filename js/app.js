@@ -13,9 +13,14 @@ import { keepAwake, allowSleep, wakeState, onWakeChange } from './wakelock.js';
 import { samplesToCsv, sessionBundle, download, fileStem, exportAll, importData } from './export.js';
 import * as sync from './sync.js';
 import {
-  coachConfigured, sessionContext, trendContext, buildMessages, sendChat, sendToSession,
+  coachConfigured, sessionContext, trendContext, buildMessages, sendChat, sendToSession, sendMessageToSession,
   autoSendEnabled, coachSessionKey, sessionKeyIssue,
 } from './coach.js';
+import { normalizeChannels, settingsForRoute, syncLegacyKey, ROUTES, ROUTE_LABELS } from './channels.js';
+import { createFuel } from './fuel.js';
+import { createFuelUi } from './fuel-ui.js';
+import { makeDecider, testDecide, DECIDE_MODES, DECIDE_MODE_LABELS } from './fuel-decide.js';
+import { MODELS as DECIDE_MODELS } from './fuel-questions.js';
 import { createCoachSync } from './coach-sync.js';
 import { buildWorkoutLog, guessKind, KINDS, KIND_LABELS, isDemoSession } from './workout-log.js';
 import { generateDemoHistory, removeDemoHistory } from './demo.js';
@@ -52,6 +57,42 @@ const coachSync = createCoachSync({
   buildLog: buildWorkoutLog,
   online: () => navigator.onLine !== false,
 });
+
+// Fuel: meal logs + weigh-ins -> estimate (server-side decision endpoint) -> coach food channel.
+const fuel = createFuel({
+  db,
+  decide: makeDecider(() => state.settings),
+  askCoach: (settings, message) => sendMessageToSession(settings, message, { timeoutMs: 120000 }),
+  sendLog: (settings, text) => sendToSession(settings, text),
+  getSettings: () => state.settings,
+  routeSettings: settingsForRoute,
+  coachReady: coachConfigured,
+  online: () => navigator.onLine !== false,
+  onTargets: (t) => {
+    const s = state.settings;
+    if (t.kcal === s.fuelKcalTarget && t.protein_g === s.fuelProteinTarget) return; // already in use
+    if (s.fuelDismissedTargets && t.kcal === s.fuelDismissedTargets.kcal && t.protein_g === s.fuelDismissedTargets.protein_g) return;
+    state.settings = saveSettings({ fuelProposedTargets: t });
+  },
+});
+let fuelUi = null;
+
+/** A meal was saved (or answered): estimate if needed, then hand it to the coach + Supabase. */
+async function afterMealSaved(id) {
+  const m = await fuel.process(id);
+  if (m && (m.estimate?.state === 'done' || m.status === 'skipped' || m.estimate?.state === 'none')) {
+    if (state.settings.fuelAutoSend !== false) await fuel.sendToCoach('meal', id);
+    sync.syncNow();
+  }
+}
+async function afterWeighIn() {
+  if (state.settings.fuelAutoSend !== false) await fuel.retryAll();
+  sync.syncNow();
+}
+const rerenderFuel = debounce(() => {
+  if (document.body.dataset.screen === 'fuel' && fuelUi && !fuelUi.hasDraft()) fuelUi.render();
+}, 150);
+fuel.onChange(() => rerenderFuel());
 
 /** Called once a finished workout (and its notes, if any) is safely in IndexedDB. */
 async function afterWorkoutSaved(id) {
@@ -117,7 +158,7 @@ async function route() {
   const [name = '', id] = h.slice(2).split('/');
   if (state.recorder.active && name !== 'live' && name !== 'connecting') {
     // A workout is running: keep the user on it (they can still open settings/dashboard).
-    if (!['settings', 'dashboard', 'session'].includes(name)) { go('#/live'); return; }
+    if (!['settings', 'dashboard', 'session', 'fuel'].includes(name)) { go('#/live'); return; }
   }
   switch (name) {
     case '': case 'start': return renderStart();
@@ -126,6 +167,7 @@ async function route() {
     case 'notes': return renderNotes(id);
     case 'session': return renderSession(id);
     case 'dashboard': return renderDashboard();
+    case 'fuel': return renderFuel();
     case 'settings': return renderSettings();
     default: return go('#/');
   }
@@ -759,7 +801,72 @@ async function renderDashboard() {
   $('#dash-coach').onclick = () => openCoach({ sessionId: null });
 }
 
+// ------------------------------------------------------------------ fuel
+function renderFuel() {
+  showScreen('fuel');
+  if (!fuelUi) {
+    fuelUi = createFuelUi({
+      fuel, db, esc, toast, getSettings: () => state.settings,
+      saveSettings: (patch) => { state.settings = saveSettings(patch); return state.settings; },
+      isDemo, isStale: () => document.body.dataset.screen !== 'fuel', syncNow: () => sync.syncNow(),
+      onRedraw: (fn) => { state.redraw = fn; }, afterMealSaved, afterWeighIn,
+    });
+  }
+  return fuelUi.render();
+}
+
 // ------------------------------------------------------------------ settings
+function channelsEditor(s) {
+  const chans = normalizeChannels(s.coachChannels);
+  let workoutsKeyNamed = false;
+  return `<div id="channels" class="channels">${chans.map((c, i) => {
+    const isWorkouts = c.routes.includes('workouts') && !workoutsKeyNamed;
+    if (isWorkouts) workoutsKeyNamed = true;
+    const issue = sessionKeyIssue(c.sessionKey);
+    return `<div class="channel" data-ch="${i}" data-ch-id="${esc(c.id)}">
+      <div class="field-row">
+        <label class="field"><span>Channel name</span><input type="text" data-ch-field="name" value="${esc(c.name)}" autocomplete="off"></label>
+        <label class="field grow"><span>Session key</span><input type="text" data-ch-field="sessionKey"${isWorkouts ? ' name="coachSessionKey"' : ''} placeholder="agent:main:telegram:group:…:topic:…" value="${esc(c.sessionKey)}" spellcheck="false" autocomplete="off" autocapitalize="off"></label>
+      </div>
+      <div class="channel-routes">${ROUTES.map((r) => `<label class="check"><input type="checkbox" data-ch-route="${r}"${c.routes.includes(r) ? ' checked' : ''}> ${ROUTE_LABELS[r]}</label>`).join('')}
+        <button type="button" class="btn small ghost" data-ch-remove="${i}">Remove</button></div>
+      <p class="muted small${issue ? ' warn-text' : ''}"${isWorkouts ? ' id="session-key-hint"' : ''} data-ch-hint>${esc(issue || (isWorkouts ? 'Workout logs and coach chat go to this session (sent as x-openclaw-session-key; find it with openclaw sessions). Leave empty for stateless chats, or set OPENCLAW_SESSION_KEY on the proxy instead.' : c.routes.length ? `Gets: ${c.routes.map((r) => ROUTE_LABELS[r].toLowerCase()).join(', ')}.${c.sessionKey ? '' : ' Paste its session key to start sending.'}` : 'Not routed to anything yet.'))}</p>
+    </div>`;
+  }).join('')}</div>
+  <div class="btn-row"><button type="button" class="btn small" id="add-channel">Add channel</button></div>`;
+}
+
+function readChannels(form) {
+  return normalizeChannels($$('.channel', form).map((row) => ({
+    id: row.dataset.chId,
+    name: $('[data-ch-field=name]', row).value,
+    sessionKey: $('[data-ch-field=sessionKey]', row).value,
+    routes: $$('[data-ch-route]', row).filter((c) => c.checked).map((c) => c.dataset.chRoute),
+  })));
+}
+
+function fuelSettings(s) {
+  return `<section class="card">
+        <h2>Fuel (food logging)</h2>
+        <div class="field-row">
+          <label class="field"><span>Daily calories target</span><input type="number" name="fuelKcalTarget" min="800" max="6000" step="50" value="${s.fuelKcalTarget}" inputmode="numeric"></label>
+          <label class="field"><span>Daily protein target (g)</span><input type="number" name="fuelProteinTarget" min="20" max="400" step="5" value="${s.fuelProteinTarget}" inputmode="numeric"></label>
+        </div>
+        <div class="field-row">
+          <label class="field grow"><span>Photo estimates</span><select name="decideMode">${DECIDE_MODES.map((m) => `<option value="${m}"${s.decideMode === m ? ' selected' : ''}>${DECIDE_MODE_LABELS[m]}</option>`).join('')}</select></label>
+          <label class="field"><span>Decision model</span><select name="decideModel">${DECIDE_MODELS.map((m) => `<option value="${m}"${s.decideModel === m ? ' selected' : ''}>${m}${m === 'pplx-decider-v1.2' ? ' (default)' : ''}</option>`).join('')}</select></label>
+        </div>
+        <label class="field" id="decide-token-field"${s.decideMode === 'pages' ? '' : ' hidden'}><span>Endpoint token</span><div class="inline"><input type="password" name="decideToken" value="${esc(s.decideToken)}" spellcheck="false" autocomplete="off"><button type="button" class="btn small ghost" id="show-decide-token">Show</button></div></label>
+        <div class="field-row">
+          <label class="field"><span>Ask me when model is less sure than</span><input type="number" name="decideThreshold" min="0.3" max="0.95" step="0.05" value="${s.decideThreshold}" inputmode="decimal"></label>
+          <label class="field"><span>Max questions per meal</span><input type="number" name="decideMaxAsk" min="0" max="5" step="1" value="${s.decideMaxAsk}" inputmode="numeric"></label>
+        </div>
+        <label class="check"><input type="checkbox" name="fuelAutoSend"${s.fuelAutoSend !== false ? ' checked' : ''}> Send meals and weigh-ins to the coach’s food channel</label>
+        <div class="btn-row"><button type="button" class="btn small" id="test-decide">Test estimates</button></div>
+        <p class="muted small" id="decide-test-result">Photos are shrunk on this device and sent only to the estimate service (and to your coach for items it doesn’t know). They are never uploaded to Supabase. The Perplexity API key lives on the server, never in this browser.</p>
+      </section>`;
+}
+
 async function renderSettings() {
   showScreen('settings');
   const s = state.settings;
@@ -819,12 +926,14 @@ async function renderSettings() {
         <label class="field"><span>Gateway URL</span><input type="url" name="gatewayUrl" placeholder="https://your-mac.tailnet-name.ts.net:8443" value="${esc(s.gatewayUrl)}"></label>
         <label class="field"><span>Gateway token</span><div class="inline"><input type="password" name="gatewayToken" value="${esc(s.gatewayToken)}" spellcheck="false" autocomplete="off"><button type="button" class="btn small ghost" id="show-token">Show</button></div></label>
         <label class="field"><span>Agent (model)</span><input type="text" name="coachModel" value="${esc(s.coachModel)}" spellcheck="false"></label>
-        <label class="field"><span>Coach session key</span><input type="text" name="coachSessionKey" placeholder="e.g. your Telegram coach thread’s session key" value="${esc(s.coachSessionKey)}" spellcheck="false" autocomplete="off" autocapitalize="off"></label>
-        <p class="muted small" id="session-key-hint">${esc(sessionKeyIssue(s.coachSessionKey) || 'Optional. Sent as x-openclaw-session-key so every coach message lands in that one OpenClaw session (find it with openclaw sessions). Leave empty for stateless chats, or set OPENCLAW_SESSION_KEY on the proxy instead.')}</p>
+        <h3 class="h3">Coach channels</h3>
+        <p class="muted small">Each channel is one OpenClaw session (for example a Telegram topic). Workouts, food logs and weigh-ins go to the channel they’re routed to.</p>
+        ${channelsEditor(s)}
         <label class="check"><input type="checkbox" name="coachAutoSend" id="coach-autosend"${(typeof s.coachAutoSend === 'boolean' ? s.coachAutoSend : !!coachSessionKey(s)) ? ' checked' : ''}> Send each workout to coach automatically</label>
         <div class="btn-row"><button type="button" class="btn small" id="test-coach">Test connection</button></div>
         <p class="muted small" id="coach-test-result">The token stays in this browser only (localStorage). It never goes into the repo or to Supabase.</p>
       </section>
+      ${fuelSettings(s)}
       <section class="card">
         <h2>Your data</h2>
         <div class="btn-row">
@@ -849,6 +958,24 @@ async function renderSettings() {
   };
   $('#demo-clear').onclick = async () => { const n = await removeDemoHistory(); toast(`Removed ${n} demo workouts`); };
   $('#test-coach').onclick = testCoach;
+  $('#add-channel').onclick = () => {
+    state.settings = saveSettings({ coachChannels: [...readChannels(form), { id: `channel-${Date.now().toString(36)}`, name: 'New channel', sessionKey: '', routes: [] }] });
+    renderSettings();
+  };
+  $$('[data-ch-remove]', form).forEach((b) => { b.onclick = () => {
+    const chans = readChannels(form).filter((_, i) => i !== +b.dataset.chRemove);
+    state.settings = saveSettings({ coachChannels: chans, coachSessionKey: syncLegacyKey(chans) });
+    renderSettings();
+  }; });
+  $('#show-decide-token').onclick = () => {
+    const i = form.elements.decideToken; i.type = i.type === 'password' ? 'text' : 'password';
+    $('#show-decide-token').textContent = i.type === 'password' ? 'Show' : 'Hide';
+  };
+  $('#test-decide').onclick = async () => {
+    const out = $('#decide-test-result');
+    out.textContent = 'Testing…';
+    try { out.textContent = await testDecide(state.settings); } catch (e) { out.textContent = `Couldn’t reach the estimate service: ${e.message}`; }
+  };
   $('#coach-autosend').addEventListener('change', (e) => {
     e.stopPropagation();
     state.settings = saveSettings({ coachAutoSend: e.target.checked });
@@ -902,20 +1029,32 @@ function onSettingsInput(form) {
     supabaseUrl: f.supabaseUrl.value.trim(), supabaseAnonKey: f.supabaseAnonKey.value.trim(),
     gatewayUrl: f.gatewayUrl.value.trim(), gatewayToken: f.gatewayToken.value.trim(),
     coachModel: f.coachModel.value.trim() || 'openclaw/default',
-    coachSessionKey: f.coachSessionKey.value.trim(),
+    coachChannels: readChannels(form),
+    coachSessionKey: syncLegacyKey(readChannels(form)),
+    fuelKcalTarget: Math.round(num(f.fuelKcalTarget.value, before.fuelKcalTarget)),
+    fuelProteinTarget: Math.round(num(f.fuelProteinTarget.value, before.fuelProteinTarget)),
+    decideMode: DECIDE_MODES.includes(f.decideMode.value) ? f.decideMode.value : 'pages',
+    decideModel: f.decideModel.value,
+    decideToken: f.decideToken.value.trim(),
+    decideThreshold: Math.min(0.95, Math.max(0.3, num(f.decideThreshold.value, before.decideThreshold))),
+    decideMaxAsk: Math.min(5, Math.max(0, Math.round(num(f.decideMaxAsk.value, before.decideMaxAsk)))),
+    fuelAutoSend: f.fuelAutoSend.checked,
+  });
+  $('#decide-token-field').hidden = state.settings.decideMode !== 'pages';
+  // per-channel session-key problems
+  $$('.channel', form).forEach((row) => {
+    const issue = sessionKeyIssue($('[data-ch-field=sessionKey]', row).value);
+    const h = $('[data-ch-hint]', row);
+    h.classList.toggle('warn-text', !!issue);
+    if (issue) h.textContent = issue;
   });
   if (!sorted) toast('Zone starts must increase from Z2 to Z5');
   state.recorder.settings = state.settings;
   applyLayout();
   // Session key: show problems; the auto-send box follows the key until the user ticks it themselves.
-  const hint = $('#session-key-hint');
-  if (hint) {
-    const issue = sessionKeyIssue(state.settings.coachSessionKey);
-    hint.classList.toggle('warn-text', !!issue);
-    if (issue) hint.textContent = issue;
-  }
   if (typeof state.settings.coachAutoSend !== 'boolean' && f.coachAutoSend) f.coachAutoSend.checked = !!coachSessionKey(state.settings);
-  if (before.gatewayUrl !== state.settings.gatewayUrl || before.gatewayToken !== state.settings.gatewayToken) coachSync.retryAll();
+  if (before.gatewayUrl !== state.settings.gatewayUrl || before.gatewayToken !== state.settings.gatewayToken) { coachSync.retryAll(); fuel.retryAll(); }
+  if (JSON.stringify(before.coachChannels) !== JSON.stringify(state.settings.coachChannels)) fuel.retryAll();
   // live-update the bpm hints
   const b = zoneBpmBounds(state.settings.maxHr, state.settings.zones);
   $$('.zones-edit small').forEach((sm, i) => { sm.textContent = `${b[i]} bpm`; });
@@ -1163,10 +1302,13 @@ async function boot() {
   // Workout logs that failed or never left (offline, coach down, app closed mid-send).
   if (coachConfigured(state.settings)) setTimeout(() => coachSync.retryAll(), 1500);
   window.addEventListener('online', () => coachSync.retryAll());
+  // Fuel: meals waiting for an estimate (offline / app closed) and logs waiting for the coach
+  setTimeout(() => fuel.retryAll().then(() => sync.syncNow()), 1800);
+  window.addEventListener('online', () => fuel.retryAll().then(() => sync.syncNow()));
   if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
     navigator.serviceWorker.register('sw.js').catch((e) => console.info('SW registration failed', e?.message));
   }
 }
 
-window.__pulse = { state, db, coachSync };
+window.__pulse = { state, db, coachSync, fuel };
 boot();
