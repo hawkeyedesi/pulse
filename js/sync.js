@@ -10,11 +10,15 @@
 // whole-session summary; hr_trace_json is the 5-s averaged trace). Deletes go through an
 // outbox (soft delete: workouts.deleted_at). Pulse workouts from other devices are pulled
 // down and rebuilt from polar_json + hr_trace_json.
+// Fuel (schema v3): finished / skipped meals upsert into `meals` on log_id and weigh-ins into
+// `weigh_ins` on log_id (days row first, like workouts). Photos are never uploaded (not even
+// the thumbnail). Deleted meals/weigh-ins are soft-deleted (deleted_at). Demo entries never sync.
 
 import * as db from './db.js';
 import { getSettings } from './settings.js';
 import { workoutLogData, supabaseWorkoutRow, isDemoSession, KINDS } from './workout-log.js';
 import { parseNotes } from './notes-parser.js';
+import { supabaseMealRow, supabaseWeighInRow, isDemoEntry } from './fuel-log.js';
 
 const SUPABASE_ESM = 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.117.2/+esm';
 const LAST_PULL_KEY = 'pulse.lastPull.v2'; // v2: workouts table (v1 pulled the old sessions table)
@@ -95,7 +99,8 @@ export async function queueRemoteDelete(sessionId, wasSynced) {
 export async function pendingCount() {
   const sessions = await db.getAll('sessions');
   const outbox = await db.getAll('outbox');
-  return sessions.filter(needsPush).length + outbox.length;
+  const [meals, weighins] = await Promise.all([db.getAll('meals'), db.getAll('weighins')]);
+  return sessions.filter(needsPush).length + outbox.length + meals.filter(mealNeedsPush).length + weighins.filter(weighInNeedsPush).length;
 }
 
 /** Run one sync pass. Safe to call often; concurrent calls share one run. */
@@ -110,7 +115,7 @@ export function syncNow() {
       if (!user) { setStatus('signed-out', 'Not signed in'); return; }
       setStatus('syncing', 'Syncing…');
       await pushDeletes(c);
-      const pushed = await pushWorkouts(c, user);
+      const pushed = (await pushWorkouts(c, user)) + (await pushFuel(c, user));
       const pulled = await pull(c);
       setStatus('ok', `Synced${pushed || pulled ? ` · ↑${pushed} ↓${pulled}` : ''}`, { user: user.email });
     } catch (e) {
@@ -153,6 +158,44 @@ async function pushWorkouts(c, user) {
     const fresh = await db.get('sessions', s.id);
     if (fresh) await db.put('sessions', { ...fresh, cloudSyncedAt: s.updatedAt });
     n++;
+  }
+  return n;
+}
+
+/** Meal that should be (re)pushed: finished estimate or skipped, not demo, changed since last push. */
+export function mealNeedsPush(m) {
+  if (!m || isDemoEntry(m)) return false;
+  if (m.deleted) return !!m.cloudSyncedAt && m.updatedAt > m.cloudSyncedAt;
+  const ready = m.status === 'skipped' || m.estimate?.state === 'done' || m.estimate?.state === 'none';
+  return ready && (!m.cloudSyncedAt || m.updatedAt > m.cloudSyncedAt);
+}
+export function weighInNeedsPush(w) {
+  if (!w || isDemoEntry(w)) return false;
+  if (w.deleted) return !!w.cloudSyncedAt && w.updatedAt > w.cloudSyncedAt;
+  return !w.cloudSyncedAt || w.updatedAt > w.cloudSyncedAt;
+}
+
+async function pushFuel(c, user) {
+  let n = 0;
+  const jobs = [
+    ['meals', 'meals', mealNeedsPush, supabaseMealRow],
+    ['weighins', 'weigh_ins', weighInNeedsPush, supabaseWeighInRow],
+  ];
+  for (const [store, table, needs, toRow] of jobs) {
+    for (const rec of (await db.getAll(store)).filter(needs)) {
+      let r;
+      if (rec.deleted) {
+        r = await c.from(table).update({ deleted_at: new Date().toISOString() }).eq('log_id', rec.log_id);
+      } else {
+        r = await c.from('days').upsert({ user_id: user.id, date: rec.date }, { onConflict: 'user_id,date', ignoreDuplicates: true });
+        if (r.error) throw r.error;
+        r = await c.from(table).upsert(toRow(rec, user.id), { onConflict: 'log_id' });
+      }
+      if (r.error) throw r.error;
+      const fresh = await db.get(store, rec.log_id);
+      if (fresh) await db.put(store, { ...fresh, cloudSyncedAt: rec.updatedAt });
+      n++;
+    }
   }
   return n;
 }
@@ -219,7 +262,7 @@ export function startAutoSync() {
   if (bound) return;
   bound = true;
   window.addEventListener('online', () => syncNow());
-  window.addEventListener('offline', () => setStatus('offline', 'Offline'));
+  window.addEventListener('offline', () => { if (syncConfigured()) setStatus('offline', 'Offline'); });
   setInterval(() => { if (document.visibilityState === 'visible') syncNow(); }, 5 * 60 * 1000);
   if (syncConfigured()) syncNow();
 }
