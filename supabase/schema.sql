@@ -1,4 +1,4 @@
--- Pulse — Supabase schema (v2: mirrors the coach's OpenClaw health.sqlite3)
+-- Pulse — Supabase schema (v3: mirrors the coach's OpenClaw health.sqlite3; v3 adds Fuel columns)
 -- Run this once in the Supabase dashboard: SQL Editor -> New query -> paste -> Run.
 -- It is safe to re-run (create ... if not exists / drop policy if exists).
 --
@@ -19,8 +19,11 @@
 -- hr_trace_json is a 5-second averaged HR trace.
 --
 -- Pulse itself writes days (user_id, date only) and workouts (source 'pulse'). It never
--- sends `number`, so the session number the coach assigns survives Pulse updates. meals and
--- weigh_ins are here for the coach / other tools; Pulse does not write them.
+-- sends `number`, so the session number the coach assigns survives Pulse updates.
+-- v3 (Fuel): Pulse also writes meals (upsert on log_id) and weigh_ins (upsert on log_id). The
+-- coach's original meal columns (date, time, items, source) are kept and filled, so its existing
+-- rows and writer keep working; the new columns are additive and nullable. See the v3 section at
+-- the bottom (idempotent ALTER TABLE ... ADD COLUMN IF NOT EXISTS + unique indexes).
 
 create extension if not exists pgcrypto;
 
@@ -126,6 +129,39 @@ end $$;
 grant usage on schema public to authenticated;
 grant select, insert, update, delete on public.days, public.workouts, public.meals, public.weigh_ins to authenticated;
 revoke all on public.days, public.workouts, public.meals, public.weigh_ins from anon;
+
+-- ---------------------------------------------------------------- v3: Fuel (meals + weigh-ins from Pulse)
+-- Safe to run on a v2 database (and to re-run). Photos are never stored here.
+alter table public.meals add column if not exists log_id          text;     -- Pulse meal uuid; upsert key
+alter table public.meals add column if not exists revision        integer not null default 1;
+alter table public.meals add column if not exists meal            text;     -- breakfast | lunch | dinner | snack
+alter table public.meals add column if not exists notes_raw       text;     -- typed / dictated note
+alter table public.meals add column if not exists kcal            real;
+alter table public.meals add column if not exists protein_g       real;
+alter table public.meals add column if not exists carbs_g         real;
+alter table public.meals add column if not exists fat_g           real;
+alter table public.meals add column if not exists estimate_source text;     -- decider | decider+coach | coach | favorite | repeat | user-edit | none
+alter table public.meals add column if not exists confidence      real;     -- 0..1 (mean answer confidence; user answers count as 1)
+alter table public.meals add column if not exists status          text not null default 'logged';
+alter table public.meals add column if not exists answers_json    jsonb;    -- items, fat, eaten, decided answers, model, threshold
+alter table public.meals add column if not exists deleted_at      timestamptz;
+create unique index if not exists meals_log_id_key on public.meals (log_id);
+create index if not exists meals_user_updated_idx on public.meals (user_id, updated_at);
+do $$ begin
+  if not exists (select 1 from pg_constraint where conname = 'meals_status_check') then
+    alter table public.meals add constraint meals_status_check check (status in ('logged', 'skipped'));
+  end if;
+  if not exists (select 1 from pg_constraint where conname = 'meals_meal_check') then
+    alter table public.meals add constraint meals_meal_check check (meal is null or meal in ('breakfast', 'lunch', 'dinner', 'snack'));
+  end if;
+end $$;
+
+alter table public.weigh_ins add column if not exists log_id      text;     -- Pulse weigh-in uuid; upsert key
+alter table public.weigh_ins add column if not exists revision    integer not null default 1;
+alter table public.weigh_ins add column if not exists deleted_at  timestamptz;
+create unique index if not exists weigh_ins_log_id_key on public.weigh_ins (log_id);
+
+-- RLS / grants are unchanged (same per-user policies on meals and weigh_ins, set above).
 
 -- ---------------------------------------------------------------- upgrading from v1
 -- Pulse v1 used sessions / samples / notes (samples held raw RR intervals). Pulse v2 no
