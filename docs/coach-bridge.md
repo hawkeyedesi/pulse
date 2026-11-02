@@ -68,13 +68,45 @@ The older `coach-proxy.mjs` is a CORS-only passthrough; it does not solve delive
    message in the Telegram topic. Check that the coach did not add the demo to your
    actual training records, then turn Demo strap back off.
 
+## Fuel: a food channel and photo estimates (optional)
+
+Pulse's Fuel tab sends meal logs and weigh-ins to a **separate** coach thread, so food never
+lands in the workout topic.
+
+- `OPENCLAW_FOOD_SESSION_KEY='agent:main:telegram:group:YOUR_CHAT_ID:topic:FOOD_TOPIC_ID'`
+  adds a second locked session. The bridge accepts exactly these two keys
+  (`x-openclaw-session-key`), routes each to its own agent (from the key), and mirrors
+  `PULSE MEAL LOG v1` replies to the food topic (workout logs still go to the workout topic).
+  In Pulse **Settings → Coach channels**, paste the same key into the **Food** channel
+  (routes: Food logs + Weigh-ins).
+- The last user message may carry up to two `image_url` parts with **data URLs** (JPEG/PNG/WebP);
+  Pulse uses this only when the decision model can't match an item and asks the food coach
+  to name it (`PULSE FOOD ID v1`, reply = a fenced json `{"items":[…]}`, nothing is logged by it).
+  Remote image URLs are rejected. Request bodies are capped at 6 MiB.
+- `PERPLEXITY_API_KEY` (environment or `~/.openclaw/.env`) turns on `POST /api/decide` and
+  `GET /api/decide/health` on the bridge: Pulse → Settings → Fuel → Photo estimates →
+  **My Mac**. The browser authenticates with the Pulse token as usual; the Perplexity key is
+  added on the Mac and never sent to the browser. (The default is the Cloudflare Pages
+  function instead; see the main README.)
+
+What the coach should do with `PULSE MEAL LOG v1` (record `meal`): upsert `days` for the date,
+then upsert `meals` by `log_id` (same `log_id` = update, never a duplicate) filling the existing
+`date`, `time`, `items`, `source` columns plus `meal`, `status` (`logged` | `skipped`),
+`notes_raw`, `kcal`, `protein_g`, `carbs_g`, `fat_g`, `estimate_source`, `confidence`,
+`answers_json`. Record `weigh_in`: upsert `weigh_ins` by `log_id` (`date`, `lbs`, `note`).
+`source: demo` must never be inserted. To suggest new daily targets, the coach adds a line
+`TARGETS: kcal=<n> protein_g=<n>`; Pulse offers it as a one-tap change. The coach's own
+`health.sqlite3` needs the same additive columns as `supabase/schema.sql` v3 (nullable,
+`log_id` unique) if it wants to store them; its existing writer keeps working without them.
+
 ## Run at login on macOS
 
 Use the LaunchAgent example in the main README with these changes:
 
 - `ProgramArguments`: your absolute Node 22+ path and absolute
   `tools/coach-local.mjs` path (not `coach-proxy.mjs`).
-- `EnvironmentVariables`: `PULSE_ORIGIN`, `OPENCLAW_SESSION_KEY`, and `PATH` including
+- `EnvironmentVariables`: `PULSE_ORIGIN`, `OPENCLAW_SESSION_KEY` (and optionally
+  `OPENCLAW_FOOD_SESSION_KEY`), and `PATH` including
   your Node/OpenClaw install directory (often `/opt/homebrew/bin`). No credentials.
 - `RunAtLoad` and `KeepAlive`: true.
 - Optionally set `StandardOutPath` / `StandardErrorPath` outside the repository.
@@ -94,7 +126,7 @@ Optional environment variables:
 
 ## Contracts and limitations
 
-- Only one origin, agent and session are accepted. Browser-provided model/tool
+- Only one origin and the configured sessions (workout, plus the optional food session) are accepted. Browser-provided model/tool
   overrides are dropped; only text messages and streaming choice are passed on.
   Request bodies are capped at 1 MiB.
 - The full gateway credential stays server-side. The dedicated Pulse token is
