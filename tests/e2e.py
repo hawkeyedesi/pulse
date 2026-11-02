@@ -15,6 +15,9 @@ OUT = pathlib.Path(__file__).parent / 'screenshots'
 OUT.mkdir(exist_ok=True)
 CHROMIUM = os.environ.get('CHROMIUM')
 COACH = 'https://coach.test'
+FIXTURE = pathlib.Path(__file__).parent / 'fixtures' / 'meal.jpg'
+FOOD_KEY = 'agent:main:telegram:group:-100777:topic:42'
+LEGACY_KEY = 'agent:main:telegram:group:-1003761327335:topic:2609'
 SESSION_KEY = 'agent:main:telegram:dm:424242'
 LOG_REPLY = 'Logged it. Solid upper-body session with most time in Z2-Z3. Keep the shoulder honest next time.'
 NOTES = ('Upper body day. Bench 4 sets of 8 at 155, felt strong. Pull-ups 3 by 10. '
@@ -52,6 +55,11 @@ async def attach(page, label, errors, coach_requests, coach_mode=None):
             # gateway-style agent failure (HTTP 200 + error object) -> the app marks the log failed
             return await route.fulfill(status=200, content_type='application/json', headers={'access-control-allow-origin': '*'},
                                        body=json.dumps({'error': {'message': 'agent unavailable (mock)', 'type': 'api_error'}}))
+        if coach_mode.get('reply') and body.get('stream') is False:
+            custom = coach_mode['reply'](body)
+            if custom is not None:
+                return await route.fulfill(status=200, content_type='application/json', headers={'access-control-allow-origin': '*'},
+                                           body=json.dumps({'choices': [{'message': {'role': 'assistant', 'content': custom}, 'finish_reason': 'stop'}]}))
         if body.get('stream') is False:
             return await route.fulfill(status=200, content_type='application/json', headers={'access-control-allow-origin': '*'},
                                        body=json.dumps({'choices': [{'message': {'role': 'assistant', 'content': LOG_REPLY}, 'finish_reason': 'stop'}]}))
@@ -94,6 +102,10 @@ async def wait_js(page, expr, timeout=8000):
 
 def log_requests(coach_requests):
     return [r for r in coach_requests if r['body'].get('stream') is False]
+
+def parse_meal(text):
+    m = re.search(r'```json\n(.*?)\n```', text, re.S)
+    return json.loads(m.group(1)) if m else {}
 
 def parse_log(text):
     m = re.search(r'```json\n(.*?)\n```', text, re.S)
@@ -589,7 +601,7 @@ async def sync_flow(browser, errors):
     await page.route(f'{SB}/**', sb)
     await page.add_init_script(FAKE_BT)
     await page.add_init_script(f"""if (!localStorage.getItem('pulse.settings')) localStorage.setItem('pulse.settings', JSON.stringify({{
-        demo: false, supabaseUrl: '{SB}', supabaseAnonKey: 'anon-test-key' }}));""")
+        demo: false, supabaseUrl: '{SB}', supabaseAnonKey: 'anon-test-key', decideMode: 'mock' }}));""")
     await page.goto(BASE + '#/settings')
     await page.wait_for_selector('#auth-email', timeout=15000)
     await page.fill('#auth-email', 'me@example.com')
@@ -650,6 +662,264 @@ async def sync_flow(browser, errors):
     await record('Upper A. Bench 3 by 5. Demo check.')
     await page.wait_for_timeout(1500)
     check('sync: demo workout is not pushed', len([r for r in rest if r[0] == 'POST' and '/rest/v1/workouts' in r[1]]) == n_workouts)
+    # Fuel: a finished meal and a weigh-in upsert on log_id (no photo data); demo meals never sync
+    await page.evaluate("() => { const s = JSON.parse(localStorage.getItem('pulse.settings')); s.demo = false; localStorage.setItem('pulse.settings', JSON.stringify(s)); }")
+    await page.goto(BASE + '#/fuel')
+    await page.reload()
+    await page.wait_for_selector('#fuel-camera', state='attached')
+    await page.set_input_files('#fuel-camera', str(FIXTURE))
+    await page.fill('#fuel-note', 'dal and rice')
+    await page.click('#fuel-save')
+    await page.wait_for_selector('[data-guess]', timeout=8000)
+    await page.click('[data-guess]')
+    for _ in range(50):
+        if any(r[0] == 'POST' and '/rest/v1/meals' in r[1] for r in rest): break
+        await page.wait_for_timeout(200)
+    mpost = [r for r in rest if r[0] == 'POST' and '/rest/v1/meals' in r[1]]
+    mrow = json.loads(mpost[0][2]) if mpost else {}
+    mrow = mrow[0] if isinstance(mrow, list) else mrow
+    check('sync: meals upsert on_conflict=log_id with coach + v3 columns', bool(mpost) and 'on_conflict=log_id' in mpost[0][1]
+          and {'log_id', 'date', 'time', 'items', 'source', 'meal', 'status', 'kcal', 'protein_g', 'estimate_source', 'confidence', 'answers_json', 'user_id'} <= set(mrow)
+          and mrow.get('status') == 'logged' and mrow.get('kcal', 0) > 0, json.dumps(mrow)[:300])
+    check('sync: meal row carries no photo / thumbnail', bool(mpost) and 'data:image' not in (mpost[0][2] or '') and 'thumb' not in mrow)
+    await page.fill('#fuel-lbs', '177.2')
+    await page.click('#fuel-weigh')
+    for _ in range(40):
+        if any(r[0] == 'POST' and '/rest/v1/weigh_ins' in r[1] for r in rest): break
+        await page.wait_for_timeout(200)
+    wpost = [r for r in rest if r[0] == 'POST' and '/rest/v1/weigh_ins' in r[1]]
+    wi = json.loads(wpost[0][2]) if wpost else {}
+    wi = wi[0] if isinstance(wi, list) else wi
+    check('sync: weigh_ins upsert on log_id (lbs)', bool(wpost) and 'on_conflict=log_id' in wpost[0][1] and wi.get('lbs') == 177.2, json.dumps(wi))
+    n_meals = len([r for r in rest if r[0] == 'POST' and '/rest/v1/meals' in r[1]])
+    await page.goto(BASE + '?demo=1#/fuel')
+    await page.wait_for_selector('#fuel-note-only')
+    await page.click('#fuel-note-only')
+    await page.fill('#fuel-note', 'banana')
+    await page.click('#fuel-save')
+    await page.wait_for_timeout(1800)
+    check('sync: demo meal is not pushed', len([r for r in rest if r[0] == 'POST' and '/rest/v1/meals' in r[1]]) == n_meals)
+    await ctx.close()
+
+async def fuel_flow(browser, errors):
+    """Fuel tab in mock mode: photo -> tap questions -> totals -> food-channel log; offline queue;
+    repeat / skip / favourite / weigh-in; unknown item named by the coach; pages-mode request shape."""
+    ctx = await browser.new_context(viewport={'width': 390, 'height': 844}, device_scale_factor=2, is_mobile=True, has_touch=True, service_workers='block')
+    page = await ctx.new_page()
+    coach_requests = []
+    def reply(body):
+        m = body['messages'][-1]
+        c = m['content']
+        if isinstance(c, list):
+            text = ''.join(p.get('text', '') for p in c if p.get('type') == 'text')
+            if text.startswith('PULSE FOOD ID v1'):
+                return '```json\n{"items":[{"name":"Mystery stew","portion":"1 bowl","kcal":410,"protein_g":22,"carbs_g":30,"fat_g":20,"confidence":0.7}]}\n```'
+        if isinstance(c, str) and c.startswith('PULSE MEAL LOG v1'):
+            return 'Logged. Good protein at lunch.\nTARGETS: kcal=2100 protein_g=150'
+        return None
+    await attach(page, 'fuel', errors, coach_requests, {'reply': reply})
+    channels = [{'id': 'workouts', 'name': 'Workouts', 'sessionKey': SESSION_KEY, 'routes': ['workouts']},
+                {'id': 'food', 'name': 'Food', 'sessionKey': FOOD_KEY, 'routes': ['food', 'weighins']}]
+    await page.add_init_script(f"""
+      if (!localStorage.getItem('pulse.settings')) localStorage.setItem('pulse.settings', JSON.stringify({{
+        demo: false, gatewayUrl: '{COACH}', gatewayToken: 'test-token', coachModel: 'openclaw/default', coachSessionKey: '{SESSION_KEY}',
+        coachChannels: {json.dumps(channels)}, decideMode: 'mock', fuelKcalTarget: 2200, fuelProteinTarget: 140
+      }}));
+    """)
+    await page.goto(BASE + '#/fuel')
+    await page.wait_for_selector('#screen-fuel:not([hidden]) #fuel-log-btn')
+    check('fuel: tab opens with Log food button + nav active', await page.is_visible('#fuel-log-btn') and 'active' in (await page.get_attribute('.nav a[data-nav=fuel]', 'class') or ''))
+    check('fuel: camera input uses capture=environment', await page.get_attribute('#fuel-camera', 'capture') == 'environment' and (await page.get_attribute('#fuel-camera', 'accept')).startswith('image/'))
+    await no_overflow(page, 'fuel phone (empty)')
+    await page.screenshot(path=str(OUT / 'phone-12-fuel-empty.png'), full_page=True)
+
+    # 1. photo + note -> saved instantly, estimated (mock), two tap questions
+    await page.set_input_files('#fuel-camera', str(FIXTURE))
+    await page.wait_for_selector('.fuel-composer .fuel-preview')
+    guessed = await page.evaluate("document.querySelector('.fuel-composer [data-meal].on')?.dataset.meal")
+    check('fuel: meal type auto-guessed from the clock', guessed in ('breakfast', 'lunch', 'dinner', 'snack'), guessed)
+    await page.fill('#fuel-note', 'dal rice and 2 roti')
+    await page.click('.fuel-composer [data-meal=lunch]')
+    await page.click('#fuel-save')
+    await page.wait_for_selector('.fuel-questions', timeout=8000)
+    stored = await page.evaluate("""async () => {
+      const db = window.__pulse.db;
+      const meals = await db.getAll('meals'); const photos = await db.getAll('mealphotos');
+      const m = meals[0]; const p = photos[0];
+      const dims = p ? await new Promise((res) => { const i = new Image(); i.onload = () => res([i.width, i.height]); i.src = p.photo; }) : null;
+      return { n: meals.length, meal: m.meal, note: m.notes_raw, thumbLen: (m.thumb || '').length, photos: photos.length, dims, state: m.estimate.state, ask: m.estimate.ask.map(q => q.name) };
+    }""")
+    check('fuel: meal saved to IndexedDB with small thumbnail', stored['n'] == 1 and stored['meal'] == 'lunch' and stored['note'] == 'dal rice and 2 roti' and 0 < stored['thumbLen'] < 30000, json.dumps({k: stored[k] for k in ('n', 'meal', 'thumbLen')}))
+    check('fuel: photo downscaled to <=1024 px JPEG (kept until estimated)', stored['photos'] == 1 and stored['dims'] and max(stored['dims']) <= 1024, str(stored['dims']))
+    qs = await page.eval_on_selector_all('.fuel-questions .fuel-q', 'els => els.map(e => e.dataset.q)')
+    check('fuel: low-confidence answers shown as tap questions (max 3)', 0 < len(qs) <= 3 and set(qs) == {'portion_rice', 'fat'}, ','.join(qs))
+    opts = await page.eval_on_selector_all('.fuel-q[data-q=portion_rice] [data-opt]', 'els => els.map(e => e.textContent)')
+    check('fuel: portion options are the fixed choices', opts == ['½ cup', '1 cup', '1½ cups', '2+ cups'], str(opts))
+    await page.screenshot(path=str(OUT / 'phone-13-fuel-questions.png'), full_page=True)
+    await page.click('.fuel-q[data-q=portion_rice] [data-opt]:nth-child(2)')
+    await page.click('.fuel-q[data-q=fat] [data-opt]:nth-child(2)')
+    await page.wait_for_function("document.querySelector('#fuel-kcal')?.textContent === '625'", timeout=8000)
+    check('fuel: totals computed in code (rice 1 cup + 2 roti + dal 1 cup = 625 kcal, 23 g protein)', await page.inner_text('#fuel-protein') == '23')
+    meal = await page.evaluate("window.__pulse.db.getAll('meals').then(m => m[0])")
+    photos_left = await page.evaluate("window.__pulse.db.getAll('mealphotos').then(p => p.length)")
+    check('fuel: estimate stored with source + confidence; full photo deleted', meal['estimate']['state'] == 'done' and meal['estimate']['estimate_source'] == 'decider'
+          and 0 < meal['estimate']['confidence'] <= 1 and photos_left == 0, f"{meal['estimate'].get('estimate_source')} {meal['estimate'].get('confidence')} photos={photos_left}")
+    for _ in range(40):
+        if any((r['body']['messages'][0]['content'] if isinstance(r['body']['messages'][0]['content'], str) else '').startswith('PULSE MEAL LOG v1') for r in coach_requests): break
+        await page.wait_for_timeout(200)
+    logs = [r for r in coach_requests if isinstance(r['body']['messages'][0]['content'], str) and r['body']['messages'][0]['content'].startswith('PULSE MEAL LOG v1')]
+    d = parse_meal(logs[0]['body']['messages'][0]['content']) if logs else {}
+    check('fuel: PULSE MEAL LOG v1 sent to the FOOD channel (not workouts)', bool(logs) and logs[0]['headers'].get('x-openclaw-session-key') == FOOD_KEY and logs[0]['body'].get('stream') is False,
+          logs[0]['headers'].get('x-openclaw-session-key') if logs else 'none')
+    want = {'log_id', 'revision', 'date', 'time', 'items', 'source', 'meal', 'status', 'notes_raw', 'kcal', 'protein_g', 'carbs_g', 'fat_g', 'estimate_source', 'confidence', 'answers_json'}
+    check('fuel: meal payload mirrors coach meals row + v3 columns', want <= set(d) and d['record'] == 'meal' and d['kcal'] == 625 and d['source'] == 'pulse' and d['meal'] == 'lunch' and 'Rice' in d['items'],
+          ','.join(sorted(want - set(d))))
+    check('fuel: meal log carries no photo data', bool(logs) and 'data:image' not in json.dumps(logs[0]['body']))
+    await page.wait_for_selector('#fuel-proposed', timeout=5000)
+    await page.click('#fuel-accept-targets')
+    await page.wait_for_timeout(300)
+    s = await page.evaluate("JSON.parse(localStorage.getItem('pulse.settings'))")
+    check('fuel: coach-proposed targets can be accepted', s.get('fuelKcalTarget') == 2100 and s.get('fuelProteinTarget') == 150)
+    await page.wait_for_selector('.fuel-meal .coach-sent')
+    check('fuel: meal shows Coach ✓', 'Coach' in await page.inner_text('.fuel-meal'))
+
+    # 2. offline: note-only meal is saved and queued, estimated once back online
+    await ctx.set_offline(True)
+    await page.click('#fuel-note-only')
+    await page.fill('#fuel-note', 'oatmeal and banana')
+    await page.click('.fuel-composer [data-meal=snack]')
+    await page.click('#fuel-save')
+    await page.wait_for_timeout(600)
+    q = await page.evaluate("window.__pulse.db.getAll('meals').then(m => m.filter(x => x.notes_raw === 'oatmeal and banana').map(x => x.estimate.state))")
+    check('fuel: offline meal saved and queued', q == ['queued'], str(q))
+    check('fuel: queued chip visible', 'Waiting to estimate' in await page.inner_text('#screen-fuel'))
+    await ctx.set_offline(False)
+    await page.evaluate("window.dispatchEvent(new Event('online'))")
+    await page.wait_for_selector('.fuel-questions [data-guess]', timeout=8000)
+    await page.click('.fuel-questions [data-guess]')
+    await wait_js(page, "window.__pulse.db.getAll('meals').then(m => m.find(x => x.notes_raw === 'oatmeal and banana')?.estimate.state === 'done')", 8000)
+    check('fuel: queued meal estimated after reconnect (best guesses)', True)
+
+    # 3. repeat chip, skip, favourite, weigh-in
+    n_before = await page.evaluate("window.__pulse.db.getAll('meals').then(m => m.length)")
+    await page.click('#fuel-quick [data-repeat]')
+    await page.wait_for_timeout(500)
+    rep = await page.evaluate("window.__pulse.db.getAll('meals').then(m => m.sort((a,b)=>b.createdAt-a.createdAt)[0])")
+    check('fuel: repeat chip logs a copy instantly', rep['estimate']['state'] == 'done' and rep['estimate']['estimate_source'] == 'repeat' and rep['estimate']['kcal'] > 0
+          and await page.evaluate("window.__pulse.db.getAll('meals').then(m => m.length)") == n_before + 1)
+    await page.wait_for_timeout(400)
+    skipped = await page.get_attribute('[data-skip]', 'data-skip', timeout=3000)
+    if skipped: await page.click(f'[data-skip={skipped}]')
+    await page.wait_for_timeout(500)
+    sk = await page.evaluate(f"window.__pulse.db.getAll('meals').then(m => m.filter(x => x.status === 'skipped').map(x => x.meal))")
+    check('fuel: mark a main meal skipped', skipped and sk == [skipped], f'{skipped} {sk}')
+    await page.click('[data-favsave]')
+    await page.wait_for_selector('#fuel-quick [data-fav]', timeout=4000)
+    check('fuel: save favourite -> favourite chip', True)
+    await page.fill('#fuel-lbs', '176.4')
+    await page.click('#fuel-weigh')
+    await page.wait_for_function("document.querySelector('#fuel-wt-summary')?.textContent.startsWith('176.4 lb')", timeout=5000)
+    for _ in range(30):
+        if any(isinstance(r['body']['messages'][0]['content'], str) and '"record":"weigh_in"' in r['body']['messages'][0]['content'] for r in coach_requests): break
+        await page.wait_for_timeout(200)
+    wl = [r for r in coach_requests if isinstance(r['body']['messages'][0]['content'], str) and '"record":"weigh_in"' in r['body']['messages'][0]['content']]
+    wd = parse_meal(wl[0]['body']['messages'][0]['content']) if wl else {}
+    check('fuel: weigh-in sent to food channel (lbs)', bool(wl) and wl[0]['headers'].get('x-openclaw-session-key') == FOOD_KEY and wd.get('lbs') == 176.4)
+    skips = [r for r in coach_requests if isinstance(r['body']['messages'][0]['content'], str) and '"status":"skipped"' in r['body']['messages'][0]['content']]
+    check('fuel: skipped meal logged to coach as status skipped', bool(skips))
+
+    # 4. unknown food -> the coach names it from the photo (image_url part on the food channel)
+    await page.set_input_files('#fuel-camera', str(FIXTURE))
+    await page.fill('#fuel-note', 'mystery stew from the office')
+    await page.click('#fuel-save')
+    await wait_js(page, "window.__pulse.db.getAll('meals').then(m => m.find(x => (x.notes_raw||'').startsWith('mystery'))?.estimate.state === 'done')", 10000)
+    ids = [r for r in coach_requests if isinstance(r['body']['messages'][0]['content'], list)]
+    parts = ids[0]['body']['messages'][0]['content'] if ids else []
+    check('fuel: unknown item -> coach asked with photo on the food channel', bool(ids) and ids[0]['headers'].get('x-openclaw-session-key') == FOOD_KEY
+          and any(p.get('type') == 'image_url' and p['image_url']['url'].startswith('data:image/jpeg') for p in parts))
+    my = await page.evaluate("window.__pulse.db.getAll('meals').then(m => m.find(x => (x.notes_raw||'').startsWith('mystery')).estimate)")
+    check('fuel: coach-provided item values used (estimate_source coach)', my.get('estimate_source') == 'coach' and my['kcal'] == 410 and my['items'][0]['name'] == 'Mystery stew', f"{my.get('estimate_source')} {my.get('kcal')}")
+    check('fuel: workout channel never received food logs', not any(r['headers'].get('x-openclaw-session-key') == SESSION_KEY for r in coach_requests))
+    tiles = await page.inner_text('#fuel-week')
+    check('fuel: weekly adherence tile renders', re.match(r'^\d/7$', tiles) is not None, tiles)
+    await no_overflow(page, 'fuel phone (logged)')
+    await page.screenshot(path=str(OUT / 'phone-14-fuel-today.png'), full_page=True)
+
+    # 5. pages mode: same-origin /api/decide with bearer token; key never in the browser
+    decide_reqs = []
+    async def decide_route(route):
+        req = route.request
+        body = json.loads(req.post_data or '{}')
+        decide_reqs.append({'headers': req.headers, 'body': body})
+        ans = {}
+        for name, q in body['questions'].items():
+            if q['type'] == 'noul':
+                ans[name] = {'type': 'noul', 'noul': 0.97 if name in ('has_rice', 'has_dal') else 0.02}
+            else:
+                keys = list(q['criteria'].keys())
+                pick = 'all' if name == 'eaten' else 'none' if name == 'favorite' else keys[1] if len(keys) > 1 else keys[0]
+                ans[name] = {'type': 'choice', 'choice': pick, 'confidence': 0.9, 'probabilities': {k: (0.93 if k == pick else 0.07 / max(1, len(keys) - 1)) for k in keys}}
+        await route.fulfill(status=200, content_type='application/json', body=json.dumps({'model': body['model'], 'answers': ans, 'usage': {'input_tokens': 500}, 'request_id': 'test'}))
+    await page.route('**/api/decide', decide_route)
+    await page.evaluate("() => { const s = JSON.parse(localStorage.getItem('pulse.settings')); s.decideMode = 'pages'; s.decideToken = 'pulse-endpoint-token'; localStorage.setItem('pulse.settings', JSON.stringify(s)); }")
+    await page.reload()
+    await page.wait_for_selector('#fuel-camera', state='attached')
+    await page.set_input_files('#fuel-camera', str(FIXTURE))
+    await page.fill('#fuel-note', 'rice and dal')
+    await page.click('#fuel-save')
+    await wait_js(page, "window.__pulse.db.getAll('meals').then(m => m.find(x => x.notes_raw === 'rice and dal')?.estimate.state === 'done')", 10000)
+    r0 = decide_reqs[0] if decide_reqs else {'headers': {}, 'body': {}}
+    st = r0['body'].get('state', {})
+    check('fuel(pages): POST ./api/decide with endpoint bearer token', len(decide_reqs) == 2 and r0['headers'].get('authorization') == 'Bearer pulse-endpoint-token', str(len(decide_reqs)))
+    check('fuel(pages): request = model + state(photo data URL, note) + fixed questions (<=128)', r0['body'].get('model') == 'pplx-decider-v1.2'
+          and st.get('photo', {}).get('image_url', {}).get('url', '').startswith('data:image/jpeg;base64,') and st.get('note') == 'rice and dal'
+          and 0 < len(r0['body']['questions']) <= 128 and all(q['type'] in ('noul', 'choice', 'score') for q in r0['body']['questions'].values()))
+    check('fuel(pages): high-confidence answers accepted silently (no questions)', not await page.query_selector('.fuel-questions'))
+    check('fuel(pages): no Perplexity key or host in the browser request', 'perplexity' not in json.dumps(r0).lower())
+    await ctx.close()
+
+    # desk layout
+    ctx = await browser.new_context(viewport={'width': 1440, 'height': 900}, service_workers='block')
+    page = await ctx.new_page()
+    await attach(page, 'fuel-desk', errors, [])
+    await page.add_init_script(f"""if (!localStorage.getItem('pulse.settings')) localStorage.setItem('pulse.settings', JSON.stringify({{ decideMode: 'mock', layout: 'desk' }}));""")
+    await page.goto(BASE + '#/fuel')
+    await page.wait_for_selector('#fuel-log-btn')
+    await page.click('#fuel-note-only'); await page.fill('#fuel-note', 'chicken breast and salad'); await page.click('#fuel-save')
+    await page.wait_for_selector('.fuel-questions [data-guess]', timeout=8000); await page.click('.fuel-questions [data-guess]')
+    await page.wait_for_timeout(500)
+    await page.click('#fuel-note-only'); await page.fill('#fuel-note', 'thali with rice and dal'); await page.click('#fuel-save')
+    await page.wait_for_selector('.fuel-q[data-q=items_check]', timeout=8000)
+    pre = await page.eval_on_selector_all('.fuel-q[data-q=items_check] [data-opt].on', 'els => els.map(e => JSON.parse(e.dataset.opt))')
+    check('fuel: uncertain foods -> one multi-select check, likely ones pre-selected', sorted(pre) == ['sabzi', 'salad'], str(pre))
+    await page.click('.fuel-q[data-q=items_check] [data-opt=\'"salad"\']')
+    await page.click('[data-done]')
+    await wait_js(page, "window.__pulse.db.getAll('meals').then(m => m.find(x => (x.notes_raw||'').startsWith('thali'))?.estimate.state === 'done')")
+    keys = await page.evaluate("window.__pulse.db.getAll('meals').then(m => m.find(x => (x.notes_raw||'').startsWith('thali')).estimate.items.map(i => i.key))")
+    check('fuel: multi-select answer applied (sabzi kept, salad removed; note foods counted)', set(keys) == {'rice', 'dal', 'sabzi'}, str(keys))
+    cols = await page.evaluate("getComputedStyle(document.querySelector('.fuel-grid')).gridTemplateColumns.split(' ').length")
+    check('fuel desk: two-column layout', cols == 2, str(cols))
+    await no_overflow(page, 'fuel desk')
+    await page.screenshot(path=str(OUT / 'desk-8-fuel.png'), full_page=True)
+    await ctx.close()
+
+    # migration: legacy single session key -> Workouts channel (+ empty Food channel)
+    ctx = await browser.new_context(viewport={'width': 800, 'height': 900}, service_workers='block')
+    page = await ctx.new_page()
+    await attach(page, 'migrate', errors, [])
+    await page.add_init_script(f"""if (!localStorage.getItem('pulse.settings')) localStorage.setItem('pulse.settings', JSON.stringify({{ gatewayUrl: '{COACH}', gatewayToken: 't', coachSessionKey: '{LEGACY_KEY}' }}));""")
+    await page.goto(BASE + '#/settings')
+    await page.wait_for_selector('#channels .channel')
+    s = await page.evaluate("JSON.parse(localStorage.getItem('pulse.settings'))")
+    ch = s.get('coachChannels') or []
+    check('channels: legacy key migrated to Workouts channel; Food channel routed food+weigh-ins', len(ch) == 2 and ch[0]['sessionKey'] == LEGACY_KEY and ch[0]['routes'] == ['workouts']
+          and ch[1]['routes'] == ['food', 'weighins'] and ch[1]['sessionKey'] == '' and s.get('coachSessionKey') == LEGACY_KEY, json.dumps(ch))
+    check('channels: settings shows both channels', await page.locator('#channels .channel').count() == 2 and await page.input_value('input[name=coachSessionKey]') == LEGACY_KEY)
+    await page.fill('#channels .channel:nth-child(2) [data-ch-field=sessionKey]', FOOD_KEY)
+    await page.wait_for_timeout(500)
+    s = await page.evaluate("JSON.parse(localStorage.getItem('pulse.settings'))")
+    check('channels: food key saved; workouts key unchanged', s['coachChannels'][1]['sessionKey'] == FOOD_KEY and s['coachSessionKey'] == LEGACY_KEY)
+    await page.screenshot(path=str(OUT / 'desk-9-channels.png'), full_page=True)
     await ctx.close()
 
 async def sw_check(browser, errors):
@@ -670,7 +940,7 @@ async def main():
         kw = {'args': ['--no-sandbox']}
         if CHROMIUM: kw['executable_path'] = CHROMIUM
         browser = await p.chromium.launch(**kw)
-        flows = (phone_flow, desk_flow, coach_retry_flow, fake_ble_flow, sync_flow, sw_check)
+        flows = (phone_flow, desk_flow, coach_retry_flow, fake_ble_flow, sync_flow, fuel_flow, sw_check)
         only = [x.strip() for x in os.environ.get('PULSE_FLOWS', '').split(',') if x.strip()]
         for flow in flows:
             if only and flow.__name__ not in only: continue
