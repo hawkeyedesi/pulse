@@ -19,6 +19,17 @@ export const DEFAULT_SETTINGS = {
   coachModel: 'openclaw/default',
   coachSessionKey: '', // x-openclaw-session-key: route every coach request into this OpenClaw session
   coachAutoSend: null, // null = automatic (on when a session key is set); true/false = user's explicit choice
+  // coachChannels: [{id, name, sessionKey, routes}] — created on first load by settings.js (channels.js)
+  // ---- Fuel (food logging)
+  fuelKcalTarget: 2200,
+  fuelProteinTarget: 140,
+  decideMode: 'pages', // pages | proxy | mock | off (see fuel-decide.js)
+  decideToken: '', // bearer for the Pages function (PULSE_API_TOKEN); never exported
+  decideModel: 'pplx-decider-v1.2',
+  decideThreshold: 0.6,
+  decideMaxAsk: 3,
+  fuelAutoSend: true, // send meal logs / weigh-ins to the food channel
+  fuelFavorites: [],
 };
 
 /** Zone (1..5) for a heart rate. */
