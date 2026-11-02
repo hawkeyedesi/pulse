@@ -673,3 +673,411 @@ test('Proxy: preflight allows x-openclaw-session-key; header forwarded; env defa
 test('Proxy: refuses to start with a reserved OPENCLAW_SESSION_KEY', async () => {
   await assert.rejects(() => withProxy({ OPENCLAW_SESSION_KEY: 'cron:nightly' }, async () => {}), /proxy exited 1/);
 });
+
+// ================================================================ Fuel (food logging)
+import {
+  FOODS, FOOD_BY_KEY, itemNutrition, mealNutrition, guessMeal, foodsInText, portionLabel,
+} from '../js/fuel-nutrition.js';
+import {
+  buildIdentifyQuestions, buildDetailQuestions, decideRequest, gate, applyPicks, readAnswer, resolveEstimate,
+  needsCoach, mockDecide, expectedPortion, candidateKeys, DEFAULT_MODEL,
+} from '../js/fuel-questions.js';
+import { migrateChannels, settingsForRoute, channelFor, normalizeChannels, syncLegacyKey } from '../js/channels.js';
+import {
+  buildMealLog, buildWeighInLog, parseMealLog, mealLogData, supabaseMealRow, supabaseWeighInRow, parseCoachItems,
+  coachItemsMessage, parseTargets, MEAL_LOG_HEADER,
+} from '../js/fuel-log.js';
+import { createFuel, dayTotals, streak, weeklyAdherence, weightTrend, addDays, repeatCandidates } from '../js/fuel.js';
+import { handleDecide, validateDecide } from '../_worker.js';
+import { mealNeedsPush, weighInNeedsPush } from '../js/sync.js';
+
+function fuelDb() {
+  const stores = new Map();
+  const st = (n) => { if (!stores.has(n)) stores.set(n, new Map()); return stores.get(n); };
+  return {
+    async get(n, k) { const v = st(n).get(k); return v ? structuredClone(v) : undefined; },
+    async put(n, v) { st(n).set(v.log_id, structuredClone(v)); },
+    async del(n, k) { st(n).delete(k); },
+    async getAll(n) { return [...st(n).values()].map((v) => structuredClone(v)); },
+  };
+}
+const LEGACY = 'agent:main:telegram:group:-1003761327335:topic:2609';
+const FOOD = 'agent:main:telegram:group:-100777:topic:42';
+
+test('Fuel table: every food has unique key, macros and >=2 portion options with unique keys', () => {
+  assert.equal(new Set(FOODS.map((f) => f.key)).size, FOODS.length);
+  for (const f of FOODS) {
+    assert.ok(f.kcal > 0 && f.protein_g >= 0 && f.carbs_g >= 0 && f.fat_g >= 0, f.key);
+    assert.ok(f.portions.length >= 2, f.key);
+    assert.equal(new Set(f.portions.map((p) => p.key)).size, f.portions.length, f.key);
+    // energy roughly consistent with macros (4/4/9), within 30 %
+    const est = f.protein_g * 4 + f.carbs_g * 4 + f.fat_g * 9;
+    assert.ok(Math.abs(est - f.kcal) / f.kcal < 0.3, `${f.key}: ${est} vs ${f.kcal}`);
+  }
+  for (const k of ['rice', 'roti', 'dal', 'paneer_curry', 'idli', 'dosa', 'eggs', 'oatmeal', 'chicken_breast', 'pizza', 'burger']) assert.ok(FOOD_BY_KEY[k], k);
+});
+
+test('Fuel math: portions, cooking fat and amount eaten', () => {
+  assert.deepEqual(itemNutrition({ key: 'rice', portion: 'one_cup' }), { kcal: 205, protein_g: 4.3, carbs_g: 45, fat_g: 0.4 });
+  assert.equal(itemNutrition({ key: 'roti', portion: 'two' }).kcal, 220);
+  // cooked dish: "a lot" of fat adds a tablespoon (120 kcal, 13.5 g fat); "none" removes the base oil
+  assert.equal(itemNutrition({ key: 'dal', portion: 'one_cup' }, { fat: 'a_lot' }).kcal, 320);
+  assert.equal(itemNutrition({ key: 'dal', portion: 'one_cup' }, { fat: 'none' }).kcal, 180);
+  assert.equal(itemNutrition({ key: 'rice', portion: 'one_cup' }, { fat: 'a_lot' }).kcal, 205); // plain rice: not a cooked dish
+  assert.equal(itemNutrition({ key: 'dal', portion: 'one_cup' }, { eaten: 'half' }).kcal, 100);
+  const m = mealNutrition([{ key: 'rice', portion: 'one_cup' }, { key: 'roti', portion: 'two' }, { key: 'dal', portion: 'one_cup' }]);
+  assert.equal(m.kcal, 625);
+  assert.equal(m.protein_g, 23.3);
+  // coach-provided values for an unknown item
+  assert.equal(itemNutrition({ key: null, custom: { kcal: 410, protein_g: 22 } }, { eaten: 'half' }).kcal, 205);
+  assert.equal(portionLabel('roti', 'two'), '2 pieces');
+  assert.equal(portionLabel('rice', 'one_half_cup'), '1½ cups');
+});
+
+test('Fuel: meal type from the clock and foods named in a note', () => {
+  const at = (h, m = 0) => new Date(2026, 10, 1, h, m);
+  assert.equal(guessMeal(at(8)), 'breakfast');
+  assert.equal(guessMeal(at(12, 30)), 'lunch');
+  assert.equal(guessMeal(at(19)), 'dinner');
+  assert.equal(guessMeal(at(16)), 'snack');
+  assert.equal(guessMeal(at(23)), 'snack');
+  assert.deepEqual(foodsInText('Dal, rice and 2 rotis cooked in ghee').sort(), ['dal', 'rice']);
+  assert.deepEqual(foodsInText('butter chicken with naan'), ['naan', 'chicken_curry']);
+});
+
+test('Question bank: fixed answers only, valid for the Decisions API, <=128 per call', () => {
+  const favs = [{ id: 'a1', name: 'Usual breakfast', items: [{ key: 'oatmeal', portion: 'one_cup' }] }];
+  const q1 = buildIdentifyQuestions({ favorites: favs });
+  assert.ok(Object.keys(q1).length <= 128);
+  assert.equal(q1.has_rice.type, 'noul');
+  assert.equal(q1.other_food.type, 'noul');
+  assert.deepEqual(Object.keys(q1.favorite.criteria), ['none', 'fav_a1']);
+  const q2 = buildDetailQuestions(['rice', 'roti', 'nope'], { askFat: true });
+  assert.deepEqual(Object.keys(q2), ['portion_rice', 'portion_roti', 'fat', 'eaten']);
+  assert.deepEqual(Object.keys(q2.portion_rice.criteria), ['half_cup', 'one_cup', 'one_half_cup', 'two_plus']);
+  assert.deepEqual(Object.keys(q2.fat.criteria), ['none', 'a_little', 'a_lot']);
+  assert.deepEqual(Object.keys(q2.eaten.criteria), ['all', 'most', 'half', 'little']);
+  const req = decideRequest({ meal: 'lunch', time: '12:30', note: 'x'.repeat(2000), photo: 'data:image/jpeg;base64,AAAA', favorites: favs }, q1);
+  assert.equal(req.model, DEFAULT_MODEL);
+  assert.equal(req.state.note.length, 1000);
+  assert.deepEqual(req.state.photo, { type: 'image_url', image_url: { url: 'data:image/jpeg;base64,AAAA' } });
+  assert.deepEqual(req.state.saved_meals, ['Usual breakfast']);
+  assert.equal(decideRequest({ model: 'gpt-4' }, q2).model, DEFAULT_MODEL);
+  // what the server accepts
+  assert.ok(validateDecide(req).body);
+  assert.ok(validateDecide(decideRequest({}, { ...q1, ...q2 })).body);
+});
+
+test('Confidence gating: noul |2p-1|, choice confidence; silent vs asked; max 3; impact order', () => {
+  assert.equal(readAnswer({ type: 'noul' }, { type: 'noul', noul: 0.9 }).confidence.toFixed(2), '0.80');
+  const q = { ...buildIdentifyQuestions(), ...buildDetailQuestions(['rice', 'roti', 'dal', 'eggs'], { askFat: true }) };
+  const ch = (choice, confidence) => ({ type: 'choice', choice, confidence, probabilities: {} });
+  const answers = {};
+  for (const f of FOODS) answers[`has_${f.key}`] = { type: 'noul', noul: ['rice', 'roti', 'dal'].includes(f.key) ? 0.97 : 0.02 };
+  answers.has_eggs = { type: 'noul', noul: 0.95 };
+  answers.other_food = { type: 'noul', noul: 0.05 };
+  Object.assign(answers, { portion_rice: ch('one_cup', 0.3), portion_roti: ch('two', 0.4), portion_dal: ch('one_cup', 0.9), portion_eggs: ch('two', 0.2), fat: ch('a_little', 0.1), eaten: ch('all', 0.95) });
+  const g = gate(q, answers, { threshold: 0.6, maxAsk: 3, ctx: { cookedCount: 2 } });
+  assert.equal(g.ask.length, 3);
+  assert.deepEqual(g.ask.map((x) => x.name), ['fat', 'portion_rice', 'portion_roti']); // biggest kcal swing first
+  assert.equal(g.accepted.portion_dal.source, 'model');
+  assert.equal(g.accepted.portion_eggs.source, 'model-low'); // over budget: model's answer, flagged low
+  assert.equal(g.accepted.has_rice.value, true);
+  assert.equal(g.accepted.has_pizza.value, false);
+  assert.deepEqual(g.ask[1].options.map((o) => o.label), ['½ cup', '1 cup', '1½ cups', '2+ cups']);
+  // a higher threshold asks more, maxAsk 0 asks nothing
+  assert.equal(gate(q, answers, { threshold: 0.99, maxAsk: 0 }).ask.length, 0);
+});
+
+test('Gating: uncertain foods become ONE multi-select (likely pre-selected); note foods count; portions only for known foods', () => {
+  const q = { ...buildIdentifyQuestions(), ...buildDetailQuestions(['rice', 'dal', 'dosa', 'sabzi'], { askFat: false }) };
+  const r = mockDecide(decideRequest({ note: 'thali with rice and dal' }, q));
+  const g = gate(q, r.answers, { threshold: 0.6, maxAsk: 3, known: ['rice', 'dal'] });
+  const check = g.ask.find((x) => x.name === 'items_check');
+  assert.ok(check && check.multi);
+  assert.deepEqual(check.options.map((o) => o.value), ['sabzi', 'salad', 'sambar', 'dosa']);
+  assert.deepEqual(check.suggested, ['sabzi', 'salad']);
+  assert.equal(g.accepted.has_rice.source, 'note');
+  assert.ok(!g.ask.some((x) => x.name === 'portion_dosa'), 'no portion question for a food still being checked');
+  const decided = applyPicks(g.accepted, g.ask, { items_check: ['sabzi'] });
+  assert.equal(decided.has_sabzi.value, true);
+  assert.equal(decided.has_salad.value, false);
+  assert.equal(decided.has_salad.source, 'user');
+  const est = resolveEstimate(decided);
+  assert.deepEqual(est.items.map((i) => i.key).sort(), ['dal', 'rice', 'sabzi']);
+  // ignoring the check uses the suggestions
+  const est2 = resolveEstimate(applyPicks(g.accepted, g.ask, {}));
+  assert.deepEqual(est2.items.map((i) => i.key).sort(), ['dal', 'rice', 'sabzi', 'salad']);
+});
+
+test('expectedPortion: probability-weighted, not argmax', () => {
+  assert.equal(expectedPortion('rice', { half_cup: 0.05, one_cup: 0.4, one_half_cup: 0.2, two_plus: 0.35 }), 'one_half_cup');
+  assert.equal(expectedPortion('rice', { one_cup: 1 }), 'one_cup');
+  assert.equal(expectedPortion('nope', { one_cup: 1 }), null);
+});
+
+test('Estimate: user answers win, confidence + estimate_source, favourites and coach items', () => {
+  const decided = {
+    has_rice: { value: true, confidence: 0.94, source: 'model' }, portion_rice: { value: 'one_half_cup', confidence: 1, source: 'user' },
+    has_dal: { value: true, confidence: 0.9, source: 'model' }, portion_dal: { value: 'one_cup', confidence: 0.8, source: 'model' },
+    fat: { value: 'a_lot', confidence: 1, source: 'user' }, eaten: { value: 'all', confidence: 0.9, source: 'model' },
+    other_food: { value: false, confidence: 0.9, source: 'model' },
+  };
+  const e = resolveEstimate(decided);
+  assert.equal(e.kcal, Math.round(205 * 1.5 + 320));
+  assert.equal(e.estimate_source, 'decider');
+  assert.ok(e.confidence > 0.8 && e.confidence <= 1);
+  assert.equal(needsCoach(decided), false);
+  assert.equal(needsCoach({ ...decided, other_food: { value: true, confidence: 0.9 } }), true);
+  assert.equal(needsCoach({ has_rice: { value: false, confidence: 0.9 } }), true); // nothing recognised
+  const withCoach = resolveEstimate(decided, { coachItems: [{ name: 'Gulab jamun', portion: '2', kcal: 300, protein_g: 4, carbs_g: 45, fat_g: 12, confidence: 0.6 }] });
+  assert.equal(withCoach.estimate_source, 'decider+coach');
+  assert.equal(withCoach.kcal, e.kcal + 300);
+  const favs = [{ id: 'x', name: 'Usual', items: [{ key: 'oatmeal', name: 'Oatmeal', portion: 'one_cup' }] }];
+  const f = resolveEstimate({ favorite: { value: 'fav_x', confidence: 0.9, source: 'model' }, eaten: { value: 'all', confidence: 0.9 } }, { favorites: favs });
+  assert.equal(f.estimate_source, 'favorite');
+  assert.equal(f.kcal, 160);
+});
+
+test('Coach channels: legacy key migrates to Workouts; food/weigh-ins never fall back to the workout thread', () => {
+  const legacy = { coachSessionKey: LEGACY, gatewayUrl: 'g', gatewayToken: 't' };
+  const mig = migrateChannels(legacy);
+  assert.deepEqual(mig.coachChannels, [
+    { id: 'workouts', name: 'Workouts', sessionKey: LEGACY, routes: ['workouts'] },
+    { id: 'food', name: 'Food', sessionKey: '', routes: ['food', 'weighins'] },
+  ]);
+  assert.equal(migrateChannels({ ...legacy, ...mig }), null); // idempotent
+  const s = { ...legacy, ...mig };
+  assert.equal(settingsForRoute(s, 'workouts').coachSessionKey, LEGACY);
+  assert.equal(settingsForRoute(s, 'food'), null); // food key not set yet
+  assert.equal(settingsForRoute(s, 'weighins'), null);
+  s.coachChannels[1].sessionKey = FOOD;
+  assert.equal(settingsForRoute(s, 'food').coachSessionKey, FOOD);
+  assert.equal(settingsForRoute(s, 'weighins').coachSessionKey, FOOD);
+  assert.equal(settingsForRoute(s, 'food').gatewayToken, 't');
+  // pre-channel settings object (never migrated): workouts keep the legacy key
+  assert.equal(settingsForRoute(legacy, 'workouts').coachSessionKey, LEGACY);
+  assert.equal(channelFor(legacy, 'food'), null);
+  // normalisation + legacy mirror
+  const n = normalizeChannels([{ name: 'A b!', sessionKey: ' k ', routes: ['food', 'bogus'] }, { name: 'A b!', routes: ['workouts'] }]);
+  assert.deepEqual(n.map((c) => c.id), ['a-b', 'a-b-2']);
+  assert.deepEqual(n[0].routes, ['food']);
+  assert.equal(n[0].sessionKey, 'k');
+  assert.equal(syncLegacyKey([{ sessionKey: 'w', routes: ['workouts'] }]), 'w');
+});
+
+const MEAL = {
+  log_id: 'm-1', revision: 2, date: '2026-11-01', time: '12:41', meal: 'lunch', notes_raw: 'cooked in ghee', status: 'logged', hasPhoto: true, source: 'pulse',
+  thumb: 'data:image/jpeg;base64,THUMB',
+  estimate: { state: 'done', items: [{ key: 'rice', name: 'Rice (cooked)', portion: 'one_cup', kcal: 205, protein_g: 4.3 }, { key: null, name: 'Mystery stew', portion: '1 bowl', kcal: 410 }],
+    kcal: 615, protein_g: 26.3, carbs_g: 75, fat_g: 20.4, estimate_source: 'decider+coach', confidence: 0.82, fat: 'a_lot', eaten: 'all', decided: { has_rice: { value: true } }, model: 'pplx-decider-flash-v1.2', threshold: 0.6 },
+};
+
+test('PULSE MEAL LOG v1: header, coach meals-row fields, instruction, round trip, no photos', () => {
+  const log = buildMealLog(MEAL, { now: Date.parse('2026-11-01T20:45:00Z') });
+  assert.ok(log.text.startsWith(`${MEAL_LOG_HEADER}\nlog_id: m-1 · revision: 2 · record: meal`));
+  const d = parseMealLog(log.text);
+  for (const k of ['log_id', 'revision', 'date', 'time', 'items', 'source', 'meal', 'status', 'notes_raw', 'kcal', 'protein_g', 'carbs_g', 'fat_g', 'estimate_source', 'confidence', 'answers_json']) assert.ok(k in d, k);
+  assert.equal(d.items, 'Rice (cooked) 1 cup, Mystery stew 1 bowl');
+  assert.equal(d.kcal, 615);
+  assert.equal(d.source, 'pulse');
+  assert.match(log.text, /upsert meals by log_id/);
+  assert.ok(!log.text.includes('data:image') && !log.text.includes('THUMB'));
+  const skipped = mealLogData({ ...MEAL, status: 'skipped', estimate: { state: 'none' } });
+  assert.equal(skipped.status, 'skipped');
+  assert.equal(skipped.items, 'Skipped');
+  assert.equal(skipped.kcal, null);
+  const demo = buildMealLog({ ...MEAL, demo: true, source: 'demo' });
+  assert.match(demo.text, /Do NOT insert/);
+  const w = buildWeighInLog({ log_id: 'w-1', revision: 1, date: '2026-11-01', time: '07:02', lbs: 176.4, note: null });
+  const wd = parseMealLog(w.text);
+  assert.equal(wd.record, 'weigh_in');
+  assert.equal(wd.lbs, 176.4);
+  assert.match(w.text, /upsert weigh_ins by log_id/);
+});
+
+test('Meal log rows for Supabase + coach item/targets parsing', () => {
+  const row = supabaseMealRow(MEAL, 'u1');
+  assert.equal(row.user_id, 'u1');
+  assert.equal(row.items, 'Rice (cooked) 1 cup, Mystery stew 1 bowl');
+  assert.ok(!('thumb' in row) && !JSON.stringify(row).includes('data:image'));
+  assert.deepEqual(Object.keys(supabaseWeighInRow({ log_id: 'w', date: '2026-11-01', lbs: 170 })).sort(), ['date', 'deleted_at', 'lbs', 'log_id', 'note', 'revision']);
+  assert.deepEqual(parseCoachItems('Sure!\n```json\n{"items":[{"name":"Gulab jamun","portion":"2","kcal":300,"protein_g":4}]}\n```'),
+    [{ name: 'Gulab jamun', portion: '2', kcal: 300, protein_g: 4, carbs_g: 0, fat_g: 0, confidence: 0.5 }]);
+  assert.deepEqual(parseCoachItems('no json here'), []);
+  const msg = coachItemsMessage({ meal: 'dinner', note: 'n', photo: 'data:image/jpeg;base64,AA', known: ['Rice'] });
+  assert.equal(msg.content[1].type, 'image_url');
+  assert.match(msg.content[0].text, /^PULSE FOOD ID v1/);
+  assert.deepEqual(parseTargets('ok\nTARGETS: kcal=2100 protein_g=150'), { kcal: 2100, protein_g: 150 });
+  assert.equal(parseTargets('nothing'), null);
+  assert.equal(mealNeedsPush({ ...MEAL, updatedAt: 2 }), true);
+  assert.equal(mealNeedsPush({ ...MEAL, updatedAt: 2, cloudSyncedAt: 2 }), false);
+  assert.equal(mealNeedsPush({ ...MEAL, demo: true, updatedAt: 2 }), false);
+  assert.equal(mealNeedsPush({ ...MEAL, estimate: { state: 'needs_answers' }, updatedAt: 2 }), false);
+  assert.equal(mealNeedsPush({ ...MEAL, deleted: true, updatedAt: 3 }), false); // never synced: nothing to delete
+  assert.equal(weighInNeedsPush({ log_id: 'w', updatedAt: 1 }), true);
+});
+
+test('Fuel pipeline: log -> questions -> answers -> food channel; offline queue; demo never auto-sent', async () => {
+  const db = fuelDb();
+  let online = false;
+  const sent = []; const asked = [];
+  const settings = { gatewayUrl: 'g', gatewayToken: 't', coachSessionKey: LEGACY, decideMode: 'mock', decideThreshold: 0.6, decideMaxAsk: 3,
+    coachChannels: [{ id: 'workouts', name: 'W', sessionKey: LEGACY, routes: ['workouts'] }, { id: 'food', name: 'F', sessionKey: FOOD, routes: ['food', 'weighins'] }] };
+  const fuel = createFuel({
+    db, decide: async (r) => mockDecide(r), getSettings: () => settings, routeSettings: settingsForRoute, coachReady: () => true, online: () => online,
+    askCoach: async (s, m) => { asked.push([s.coachSessionKey, m]); return '```json\n{"items":[{"name":"Mystery stew","kcal":410,"protein_g":22}]}\n```'; },
+    sendLog: async (s, text) => { sent.push([s.coachSessionKey, text]); return 'Logged.'; },
+  });
+  const m = await fuel.logMeal({ photo: 'data:image/jpeg;base64,AAAA', thumb: 't', note: 'dal rice and 2 roti', meal: 'lunch' });
+  assert.equal(m.estimate.state, 'queued');
+  assert.equal((await db.get('mealphotos', m.log_id)).photo, 'data:image/jpeg;base64,AAAA');
+  assert.equal((await fuel.process(m.log_id)).estimate.state, 'queued'); // offline: stays queued
+  online = true;
+  const p = await fuel.process(m.log_id);
+  assert.equal(p.estimate.state, 'needs_answers');
+  assert.deepEqual(p.estimate.ask.map((q) => q.name).sort(), ['fat', 'portion_rice']);
+  assert.equal((await fuel.sendToCoach('meal', m.log_id)).coach.status, 'pending'); // waits for the estimate
+  const done = await fuel.answer(m.log_id, { portion_rice: 'one_cup', fat: 'a_little' });
+  assert.equal(done.estimate.state, 'done');
+  assert.equal(done.estimate.kcal, 625);
+  assert.equal(await db.get('mealphotos', m.log_id), undefined); // full photo gone, thumbnail kept
+  assert.equal(done.thumb, 't');
+  const s1 = await fuel.sendToCoach('meal', m.log_id);
+  assert.equal(s1.coach.status, 'sent');
+  assert.equal(sent[0][0], FOOD);
+  assert.equal(parseMealLog(sent[0][1]).kcal, 625);
+  // unknown item -> the coach names it (photo + note on the food channel)
+  const u = await fuel.logMeal({ photo: 'data:image/jpeg;base64,BBBB', note: 'mystery stew', meal: 'dinner' });
+  const ud = await fuel.process(u.log_id);
+  assert.equal(ud.estimate.estimate_source, 'coach');
+  assert.equal(ud.estimate.kcal, 410);
+  assert.equal(asked[0][0], FOOD);
+  assert.equal(asked[0][1].content[1].image_url.url, 'data:image/jpeg;base64,BBBB');
+  // skipped + weigh-in + demo
+  const sk = await fuel.skipMeal({ meal: 'breakfast', date: m.date });
+  assert.equal((await fuel.skipMeal({ meal: 'breakfast', date: m.date })).log_id, sk.log_id); // idempotent
+  const w = await fuel.logWeighIn({ lbs: '176.44' });
+  assert.equal(w.lbs, 176.4);
+  await assert.rejects(() => fuel.logWeighIn({ lbs: 20 }));
+  const demo = await fuel.logMeal({ note: 'banana', demo: true });
+  await fuel.process(demo.log_id);
+  const before = sent.length;
+  const r = await fuel.retryAll();
+  assert.ok(r.sent >= 2); // the coach-named dinner, the skip, the weigh-in
+  assert.ok(sent.slice(before).every(([k]) => k === FOOD));
+  assert.ok(!sent.some(([, t]) => t.includes('"source":"demo"')));
+  assert.ok(sent.some(([, t]) => parseMealLog(t).record === 'weigh_in'));
+  // no food channel key -> nothing sent, marked no-channel
+  settings.coachChannels[1].sessionKey = '';
+  const n = await fuel.logMeal({ note: 'oatmeal', meal: 'snack' });
+  await fuel.process(n.log_id);
+  await fuel.answer(n.log_id, {}); // best guesses
+  assert.equal((await fuel.sendToCoach('meal', n.log_id)).coach.status, 'no-channel');
+});
+
+test('Fuel repeat / favourite copy items and recompute totals', async () => {
+  const db = fuelDb();
+  const fuel = createFuel({ db, decide: async (r) => mockDecide(r), getSettings: () => ({ decideMode: 'mock' }), routeSettings: () => null, askCoach: null, sendLog: null });
+  await db.put('meals', { ...MEAL, estimate: { ...MEAL.estimate, items: [{ key: 'rice', name: 'Rice (cooked)', portion: 'one_cup' }] }, createdAt: 1 });
+  const r = await fuel.repeatMeal({ from: 'm-1', meal: 'dinner' });
+  assert.equal(r.estimate.estimate_source, 'repeat');
+  assert.equal(r.estimate.kcal, 205); // plain rice: fat modifier doesn't apply
+  const f = await fuel.repeatMeal({ from: { name: 'Usual', items: [{ key: 'eggs', name: 'Eggs', portion: 'two' }] }, label: 'favorite' });
+  assert.equal(f.estimate.estimate_source, 'favorite');
+  assert.equal(f.estimate.kcal, 156);
+});
+
+test('Fuel numbers: totals, streak, weekly adherence (main meals logged or skipped), weight trend, repeat chips', () => {
+  const today = '2026-11-01';
+  const mk = (date, meal, extra = {}) => ({ log_id: `${date}-${meal}`, date, time: '12:00', meal, status: 'logged', createdAt: 1, estimate: { state: 'done', kcal: 500, protein_g: 30, items: [{ key: 'rice', name: 'Rice (cooked)', portion: 'one_cup' }] }, ...extra });
+  const meals = [];
+  for (const d of [addDays(today, -1), addDays(today, -2), addDays(today, -4)]) for (const k of ['breakfast', 'lunch', 'dinner']) meals.push(mk(d, k));
+  meals.push(mk(today, 'breakfast'), mk(today, 'lunch', { status: 'skipped', estimate: { state: 'none' } }), mk(today, 'snack', { estimate: { state: 'estimating' } }));
+  const t = dayTotals(meals, today);
+  assert.equal(t.kcal, 500);
+  assert.equal(t.pending, 1);
+  assert.deepEqual(t.mains, ['breakfast', 'lunch']);
+  assert.equal(streak(meals, today), 2); // today incomplete -> counts back from yesterday; gap on day -3
+  meals.push(mk(today, 'dinner'));
+  assert.equal(streak(meals, today), 3);
+  const wk = weeklyAdherence(meals, today);
+  assert.equal(wk.complete, 4);
+  assert.equal(wk.flags.length, 7);
+  const wt = weightTrend([{ log_id: 'a', date: addDays(today, -6), time: '07:00', lbs: 178 }, { log_id: 'b', date: today, time: '07:00', lbs: 176.5 }, { log_id: 'c', date: today, time: '06:00', lbs: 177 }, { log_id: 'd', date: addDays(today, -9), time: '07:00', lbs: 180 }], today);
+  assert.deepEqual(wt.points.map((p) => p.lbs), [178, 176.5]);
+  assert.equal(wt.change, -1.5);
+  const rc = repeatCandidates(meals, today, 'lunch');
+  assert.equal(rc[0].label, 'Same as yesterday’s lunch');
+});
+
+test('Server /api/decide: key stays server-side, token required, validation, upstream errors mapped', async () => {
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    calls.push({ url, init });
+    const body = JSON.parse(init.body);
+    if (body.state.note === 'rate') return new Response(JSON.stringify({ error: { message: 'slow down' } }), { status: 429, headers: { 'retry-after': '2' } });
+    return new Response(JSON.stringify({ model: body.model, answers: { has_rice: { type: 'noul', noul: 0.97 } }, usage: { input_tokens: 478, output_tokens: 1 } }), { status: 200, headers: { 'x-request-id': 'rid-1' } });
+  };
+  const env = { PERPLEXITY_API_KEY: 'pplx-secret', PULSE_API_TOKEN: 'tok' };
+  const body = decideRequest({ note: 'rice', photo: 'data:image/jpeg;base64,AAAA' }, { has_rice: buildIdentifyQuestions().has_rice });
+  const post = (b, auth = 'Bearer tok', e = env) => handleDecide(new Request('https://pulse-hr.pages.dev/api/decide', { method: 'POST', headers: { authorization: auth }, body: JSON.stringify(b) }), e, { fetchImpl });
+  let r = await post(body);
+  assert.equal(r.status, 200);
+  const j = await r.json();
+  assert.deepEqual(j, { model: DEFAULT_MODEL, answers: { has_rice: { type: 'noul', noul: 0.97 } }, usage: { input_tokens: 478, output_tokens: 1 }, request_id: 'rid-1' });
+  assert.equal(calls[0].url, 'https://api.perplexity.ai/v1/decisions');
+  assert.equal(calls[0].init.headers.Authorization, 'Bearer pplx-secret');
+  assert.ok(!JSON.stringify(j).includes('pplx-secret'));
+  assert.equal((await post(body, 'Bearer nope')).status, 401);
+  assert.equal((await post(body, 'Bearer tok', { PERPLEXITY_API_KEY: 'k' })).status, 401); // no token configured: closed
+  assert.equal((await post(body, 'Bearer tok', { PULSE_API_TOKEN: 'tok' })).status, 503);
+  assert.equal((await post({ ...body, model: 'gpt-4o' })).status, 400);
+  assert.equal((await post({ ...body, state: { ...body.state, photo: { type: 'image_url', image_url: { url: 'https://evil/x.jpg' } } } })).status, 400);
+  assert.equal((await post({ ...body, state: { ...body.state, extra: 1 } })).status, 400);
+  assert.equal((await post({ ...body, questions: Object.fromEntries(Array.from({ length: 129 }, (_, i) => [`q${i}`, { type: 'noul', instructions: 'x' }])) })).status, 400);
+  assert.equal((await post({ ...body, questions: { BAD: { type: 'noul', instructions: 'x' } } })).status, 400);
+  const rl = await post({ ...body, state: { ...body.state, note: 'rate' } });
+  assert.equal(rl.status, 429);
+  assert.equal(rl.headers.get('retry-after'), '2');
+  assert.match((await rl.json()).error.message, /429: slow down/);
+  assert.equal(calls.length, 2); // rejected requests never reached Perplexity
+  const h = await handleDecide(new Request('https://x/api/decide/health', { headers: { authorization: 'Bearer tok' } }), env, { fetchImpl });
+  assert.equal(h.status, 200);
+  assert.equal((await handleDecide(new Request('https://x/api/decide', { method: 'GET', headers: { authorization: 'Bearer tok' } }), env)).status, 405);
+});
+
+test('Proxy /api/decide: needs a bearer the gateway accepts; 503 without PERPLEXITY_API_KEY', async () => {
+  await withProxy({ PERPLEXITY_API_KEY: '' }, async (base, seen) => {
+    const ok = await fetch(`${base}/api/decide/health`, { headers: { Authorization: 'Bearer t', Origin: 'https://me.github.io' } });
+    assert.equal(ok.status, 503); // gateway accepted the bearer (upstream answers 200), but no key configured
+    assert.equal(seen[0].url, '/v1/models');
+    assert.equal((await fetch(`${base}/api/decide/health`, { headers: { Origin: 'https://me.github.io' } })).status, 401);
+    const pre = await fetch(`${base}/api/decide`, { method: 'OPTIONS', headers: { Origin: 'https://me.github.io', 'Access-Control-Request-Method': 'POST' } });
+    assert.equal(pre.status, 204);
+  });
+});
+
+test('Fuel: estimate endpoint not set up (401) -> coach estimates instead of blocking the meal', async () => {
+  const db = fuelDb();
+  const sent = [];
+  const settings = { gatewayUrl: 'g', gatewayToken: 't', decideMode: 'pages', coachChannels: [{ id: 'food', name: 'F', sessionKey: FOOD, routes: ['food'] }] };
+  const fuel = createFuel({
+    db, getSettings: () => settings, routeSettings: settingsForRoute, coachReady: () => true,
+    decide: async () => { const e = new Error('Invalid Pulse endpoint token'); e.status = 401; throw e; },
+    askCoach: async () => '```json\n{"items":[{"name":"Dal rice","kcal":520,"protein_g":18}]}\n```',
+    sendLog: async (s, text) => { sent.push(text); return 'ok'; },
+  });
+  const m = await fuel.logMeal({ photo: 'data:image/jpeg;base64,AAAA', note: 'lunch' });
+  const r = await fuel.process(m.log_id);
+  assert.equal(r.estimate.state, 'done');
+  assert.equal(r.estimate.estimate_source, 'coach');
+  assert.equal(r.estimate.kcal, 520);
+  assert.match(r.estimate.coachNote || '', /Estimate service: Invalid Pulse endpoint token/);
+  // no coach either -> logged without numbers (kcal null in the log), not stuck
+  settings.coachChannels[0].sessionKey = '';
+  const n = await fuel.logMeal({ note: 'snack' });
+  const rn = await fuel.process(n.log_id);
+  assert.equal(rn.estimate.estimate_source, 'none');
+  assert.equal(mealLogData(rn).kcal, null);
+});
