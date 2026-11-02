@@ -34,10 +34,11 @@ export function fileStem(session) {
 }
 
 export async function exportAll() {
-  const [sessions, samples, notes] = await Promise.all([db.getAll('sessions'), db.getAll('samples'), db.getAll('notes')]);
+  const [sessions, samples, notes, meals, weighins] = await Promise.all([db.getAll('sessions'), db.getAll('samples'), db.getAll('notes'), db.getAll('meals'), db.getAll('weighins')]);
   return {
     format: 'pulse-backup', version: 1, exportedAt: new Date().toISOString(),
     settings: exportableSettings(), sessions: sessions.filter((s) => !s.deleted), samples, notes,
+    meals: meals.filter((m) => !m.deleted), weighins: weighins.filter((w) => !w.deleted), // thumbnails only, never full photos
   };
 }
 
@@ -62,5 +63,9 @@ export async function importData(json) {
   await db.putMany('sessions', sessions);
   for (let i = 0; i < samples.length; i += 2000) await db.putMany('samples', samples.slice(i, i + 2000));
   await db.putMany('notes', notes);
-  return { sessions: sessions.length, samples: samples.length, notes: notes.length };
+  const meals = (data.format === 'pulse-backup' ? data.meals || [] : []).filter((m) => m && m.log_id && m.date).map((m) => ({ ...m, cloudSyncedAt: null }));
+  const weighins = (data.format === 'pulse-backup' ? data.weighins || [] : []).filter((w) => w && w.log_id && w.date).map((w) => ({ ...w, cloudSyncedAt: null }));
+  await db.putMany('meals', meals);
+  await db.putMany('weighins', weighins);
+  return { sessions: sessions.length, samples: samples.length, notes: notes.length, meals: meals.length, weighins: weighins.length };
 }
